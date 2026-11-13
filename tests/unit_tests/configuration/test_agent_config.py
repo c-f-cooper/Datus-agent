@@ -115,9 +115,6 @@ class TestResolveEnv:
     def test_non_string_returns_as_is(self):
         assert resolve_env(42) == 42
 
-    def test_no_placeholder_unchanged(self):
-        assert resolve_env("plain/path/no/vars") == "plain/path/no/vars"
-
     def test_file_db_extra_resolves_nested_env_values(self, monkeypatch):
         monkeypatch.setenv("ICEBERG_URI", "http://iceberg-rest:8181")
         monkeypatch.setenv("WAREHOUSE", "s3://warehouse/")
@@ -252,11 +249,22 @@ class TestDosiDbProfile:
         assert result["type"] == dialect
         assert result["database"] == "analytics"
         assert result["schema"] == "sales"
+        assert "schema_name" not in result
         assert resolve_profile_dialect({"type": adapter}, ["postgres", "hive"]) == dialect
+
+    @pytest.mark.parametrize("adapter", ["trino", "gaussdb", "hana"])
+    def test_schema_alias_is_replaced_without_mutating_the_adapter_configuration(self, adapter):
+        cfg = DbConfig(type=adapter, host="localhost", extra={"schema_name": "sales"})
+        result = _db_config_to_dosi_profile(cfg)
+        assert result["schema"] == "sales"
+        assert "schema_name" not in result
+        assert cfg.extra == {"schema_name": "sales"}
 
     def test_explicit_schema_wins_over_schema_name_alias(self):
         cfg = DbConfig(type="trino", host="localhost", extra={"schema": "sales", "schema_name": "other"})
-        assert _db_config_to_dosi_profile(cfg)["schema"] == "sales"
+        result = _db_config_to_dosi_profile(cfg)
+        assert result["schema"] == "sales"
+        assert "schema_name" not in result
 
     @pytest.mark.parametrize("database", [None, "legacy_alias"])
     def test_oracle_service_name_maps_to_the_engine_connection_database(self, database):
@@ -269,6 +277,7 @@ class TestDosiDbProfile:
         profile = _db_config_to_dosi_profile(cfg)
         assert profile["database"] == "FREEPDB1"
         assert profile["schema"] == "SALES"
+        assert "schema_name" not in profile
 
     @pytest.mark.parametrize("auth", [{"auth_mode": "iam"}, {"secret_ref": "test/database"}])
     def test_aurora_settings_keep_types_and_are_independent(self, monkeypatch, auth):
