@@ -120,6 +120,8 @@ class ManagedPluginRuntime:
         return completed
 
     def install(self, source: Path) -> subprocess.CompletedProcess[str]:
+        if source.suffix == ".whl":
+            return self.run("plugin", "install", f"whl:{source.resolve(strict=True)}")
         wheel = os.environ.get("DATUS_SQL_POLICY_WHEEL")
         if source.name == "datus-sql-policies" and wheel:
             return self.run("plugin", "install", f"whl:{Path(wheel).resolve(strict=True)}")
@@ -160,12 +162,12 @@ def required_postgresql_storage() -> RequiredPostgresqlStorage:
         vector_config = vector_environment.get_config()
         if rdb_config.backend_type != "postgresql" or vector_config.backend_type != "postgresql":
             pytest.fail(
-                "P0 PostgreSQL providers must both report backend_type=postgresql",
+                "Required PostgreSQL providers must both report backend_type=postgresql",
                 pytrace=False,
             )
         yield RequiredPostgresqlStorage(rdb_config=rdb_config, vector_config=vector_config)
     except Exception as exc:
-        pytest.fail(f"P0 PostgreSQL/pgvector setup failed: {exc}", pytrace=False)
+        pytest.fail(f"Required PostgreSQL/pgvector setup failed: {exc}", pytrace=False)
     finally:
         teardown_errors = []
         for environment in reversed(started):
@@ -174,7 +176,7 @@ def required_postgresql_storage() -> RequiredPostgresqlStorage:
             except Exception as exc:  # noqa: BLE001 - report every provider cleanup error.
                 teardown_errors.append(str(exc))
         if teardown_errors:
-            pytest.fail(f"P0 PostgreSQL/pgvector teardown failed: {'; '.join(teardown_errors)}", pytrace=False)
+            pytest.fail(f"Required PostgreSQL/pgvector teardown failed: {'; '.join(teardown_errors)}", pytrace=False)
 
 
 def _resolve_external_root() -> Path:
@@ -191,9 +193,11 @@ def _resolve_external_root() -> Path:
 
 @pytest.fixture(scope="session")
 def sql_policy_source() -> Path:
+    if wheel := os.environ.get("DATUS_SQL_POLICY_WHEEL"):
+        return Path(wheel).resolve(strict=True)
     source = _resolve_external_root() / "datus-sql-policies"
     if not source.is_dir():
-        pytest.fail(f"P0 SQL policy source checkout missing: {source}", pytrace=False)
+        pytest.fail(f"SQL policy source checkout missing: {source}", pytrace=False)
     return source
 
 
