@@ -11,6 +11,7 @@ import asyncio
 import copy
 import json
 import os
+import time
 import uuid
 from contextlib import ExitStack
 from datetime import datetime
@@ -40,7 +41,7 @@ from datus.api.services.action_sse_converter import (
     action_to_sse_event,
 )
 from datus.api.services.background_drain import track_background_task
-from datus.api.services.chat_extensions import ChatNodeFactory
+from datus.api.services.chat_extensions import ChatNodeFactory, ChatToolBinder
 from datus.api.services.semantic_model_diff import SemanticModelSnapshot
 from datus.api.services.turn_stats import TurnStatsCollector, resolve_subagent
 from datus.cli.autocomplete import AtReferenceCompleter
@@ -49,6 +50,7 @@ from datus.configuration.agent_config import AgentConfig
 from datus.schemas.action_history import ActionHistory, ActionHistoryManager, ActionRole, ActionStatus
 from datus.schemas.node_models import Metric, ReferenceSql, TableSchema
 from datus.tools.proxy.proxy_tool import apply_proxy_tools
+from datus.utils.artifact_output import session_user_scope
 from datus.utils.loggings import get_logger
 from datus.utils.path_manager import set_current_path_manager
 from datus.utils.time_utils import now_utc_iso
@@ -400,6 +402,9 @@ class ChatTask:
         self.status: str = "running"  # running | completed | error | cancelled
         self.condition = asyncio.Condition()
         self.created_at = datetime.now()
+        self.completed_at: Optional[float] = None
+        self.llm_session_id: Optional[str] = None
+        self.replay_bytes = 0
         self.error: Optional[str] = None
         self.consumer_offset: int = 0
         # Created up-front — before the node exists — so ``POST /chat/insert``
@@ -410,7 +415,8 @@ class ChatTask:
         self.message_contents: Dict[str, dict] = {}
         self.tool_result_contents: Dict[str, dict] = {}
         self.content_events: Dict[str, str] = {}
-        self.previous_message_id: Optional[int] = 0
+        # None means initialization has not captured a safe history boundary.
+        self.previous_message_id: Optional[int] = None
         # Whether ``/chat/insert`` may still enqueue. ``_run_loop`` flips this
         # off once it stops draining (final drain empty), so inserts arriving
         # during the run's tail (persist / usage / end events) get
@@ -498,14 +504,28 @@ class ChatTaskManager:
         stream_thinking: bool = False,
         *,
         node_factory: Optional[ChatNodeFactory] = None,
+        completed_task_ttl: float = COMPLETED_TASK_TTL,
+        max_completed_tasks: Optional[int] = None,
+        max_completed_bytes: Optional[int] = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Create a project task registry with optional trusted node dispatch."""
         self._node_factory = node_factory
+        if completed_task_ttl < 0 or any(
+            limit is not None and limit < 0 for limit in (max_completed_tasks, max_completed_bytes)
+        ):
+            raise ValueError("Completed-task TTL and replay limits must be non-negative")
         self._tasks: Dict[str, ChatTask] = {}
         self._completed_tasks: Dict[str, ChatTask] = {}
         self._default_source = default_source
         self._default_interactive = default_interactive
         self._stream_thinking = stream_thinking
+        self._completed_task_ttl = completed_task_ttl
+        self._max_completed_tasks = max_completed_tasks
+        self._max_completed_bytes = max_completed_bytes
+        self._clock = clock
+        self._expiry_handle: Optional[asyncio.TimerHandle] = None
+        self._closed = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -520,6 +540,8 @@ class ChatTaskManager:
         policy_context: Optional[Dict[str, Any]] = None,
         stats_context: Optional[Dict[str, Any]] = None,
         on_turn_end: Optional["TurnEndCallback"] = None,
+        *,
+        tool_binder: ChatToolBinder | None = None,
     ) -> ChatTask:
         """Create a background task for the agentic loop.
             :param sub_agent_id: builtin name or custom sub-agent DB ID
@@ -528,9 +550,19 @@ class ChatTaskManager:
                 with ``(usage, error, status, turn_id)`` — see :meth:`_settle_turn`
         Raises ``ValueError`` if a task is already running for the session.
         """
-        # Clone config to avoid cross-request mutation of shared AgentConfig
+        if self._closed:
+            raise RuntimeError("ChatTaskManager is shut down")
+        # Snapshot caller-owned configuration before waiting for a previous turn.
         agent_config = copy.deepcopy(agent_config)
         agent_config.policy_context = dict(policy_context or {})
+        prior_task = self._tasks.get(request.session_id) if request.session_id else None
+        if prior_task is not None and prior_task.status != "running" and prior_task.asyncio_task is not None:
+            # A terminal SSE frame can be consumed before native cleanup ends.
+            # Wait before loading metadata or admitting the next turn; cancelling
+            # this waiter must not cancel the preceding turn's cleanup.
+            await asyncio.shield(asyncio.gather(prior_task.asyncio_task, return_exceptions=True))
+            if self._closed:
+                raise RuntimeError("ChatTaskManager is shut down")
         # API surface has no interactive broker to confirm EXTERNAL file
         # access, so force filesystem strict mode — every node constructed
         # below reads this flag via AgenticNode._resolve_filesystem_strict().
@@ -653,6 +685,9 @@ class ChatTaskManager:
         session_id = request.session_id or f"{safe_name}_session_{str(uuid.uuid4())[:8]}"
         request.session_id = session_id
 
+        # Metadata resolution above can overlap application shutdown.
+        if self._closed:
+            raise RuntimeError("ChatTaskManager is shut down")
         if session_id in self._tasks:
             raise ValueError(f"A task is already running for session {session_id}")
 
@@ -676,6 +711,7 @@ class ChatTaskManager:
                 request,
                 sub_agent_id=sub_agent_id,
                 user_id=user_id,
+                **({"tool_binder": tool_binder} if tool_binder is not None else {}),
             )
         )
         task.asyncio_task = asyncio_task
@@ -716,9 +752,13 @@ class ChatTaskManager:
 
     def has_active_tasks(self) -> bool:
         """Return True if any task is still running."""
-        return any(t.status == "running" for t in self._tasks.values())
+        return any(
+            t.status == "running" or (t.asyncio_task is not None and not t.asyncio_task.done())
+            for t in self._tasks.values()
+        )
 
     def get_task(self, session_id: str) -> Optional[ChatTask]:
+        self._purge_expired_completed()
         return self._tasks.get(session_id) or self._completed_tasks.get(session_id)
 
     async def consume_events(self, task: ChatTask, start_from: Optional[int] = None) -> AsyncGenerator[SSEEvent, None]:
@@ -772,6 +812,10 @@ class ChatTaskManager:
 
     async def shutdown(self) -> None:
         """Cancel every running task (called at application shutdown)."""
+        self._closed = True
+        if self._expiry_handle is not None:
+            self._expiry_handle.cancel()
+            self._expiry_handle = None
         for task in list(self._tasks.values()):
             if task.asyncio_task and not task.asyncio_task.done():
                 task.asyncio_task.cancel()
@@ -780,6 +824,10 @@ class ChatTaskManager:
             await asyncio.gather(*pending, return_exceptions=True)
         self._tasks.clear()
         self._completed_tasks.clear()
+        # Finishing tasks may have scheduled an expiry while shutdown drained them.
+        if self._expiry_handle is not None:
+            self._expiry_handle.cancel()
+            self._expiry_handle = None
 
     # ------------------------------------------------------------------
     # Background loop (full agentic loop implementation)
@@ -792,6 +840,8 @@ class ChatTaskManager:
         request: StreamChatInput,
         sub_agent_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        *,
+        tool_binder: ChatToolBinder | None = None,
     ) -> None:
         """Execute the full agentic loop, pushing SSE events to the task buffer."""
         session_id = task.session_id
@@ -904,7 +954,7 @@ class ChatTaskManager:
                     base_dir = getattr(agent_config, "session_dir", None) or str(
                         get_path_manager(agent_config=agent_config).sessions_dir
                     )
-                    sm = SessionManager(session_dir=base_dir, scope=user_id)
+                    sm = SessionManager(session_dir=base_dir, scope=session_user_scope(agent_config, user_id))
                     feedback_session_id = sm.copy_session(request.source_session_id, "feedback")
 
                 return self._create_node(
@@ -916,12 +966,36 @@ class ChatTaskManager:
                     session_id=feedback_session_id,
                 )
 
-            node = await asyncio.to_thread(_init_node)
+            async def _init_owned_node():
+                node = await asyncio.to_thread(_init_node)
+                task.node = node
+                if tool_binder is not None and sub_agent_id is None and interactive_enabled:
+                    from datus.agent.node.chat_agentic_node import ChatAgenticNode
+
+                    if type(node) is ChatAgenticNode and not node._is_subagent:
+
+                        def _bind_host_tools():
+                            node.install_host_tools(tool_binder(node))
+
+                        await asyncio.to_thread(_bind_host_tools)
+                return node
+
+            initialization = asyncio.create_task(_init_owned_node())
+            try:
+                node = await asyncio.shield(initialization)
+            except asyncio.CancelledError:
+                # Worker-thread initialization cannot be stopped by cancelling
+                # its awaiter. Finish it before releasing the node.
+                async def finish_initialization():
+                    await asyncio.gather(initialization, return_exceptions=True)
+
+                await self._drain_cleanup(finish_initialization())
+                raise
             # Each request owns its node, including any continuation passes.
             # An omitted request limit must preserve the configured node limit.
             if "max_turns" in request.model_fields_set:
                 node.max_turns = request.max_turns
-            task.node = node
+            task.llm_session_id = node.session_id
             task.previous_message_id = await asyncio.to_thread(
                 self._max_message_id, agent_config, node.session_id, user_id
             )
@@ -1362,7 +1436,9 @@ class ChatTaskManager:
 
         finally:
             if task.status != "completed" and task.node is not None:
-                await self._persist_message_contents(task, agent_config, task.node.session_id, user_id)
+                await self._drain_cleanup(
+                    self._persist_message_contents(task, agent_config, task.node.session_id, user_id)
+                )
             trace_stack.close()
             self._emit_turn_stats(
                 task,
@@ -1375,12 +1451,65 @@ class ChatTaskManager:
                 turn_id=turn_id,
             )
             self._settle_turn(task, last_usage)
+            await self._drain_cleanup(self._release_task_resources(task))
             async with task.condition:
                 task.condition.notify_all()
             self._tasks.pop(session_id, None)
             # Keep completed task for resume within TTL
+            task.completed_at = self._clock()
+            self._completed_tasks.pop(session_id, None)
             self._completed_tasks[session_id] = task
             self._purge_expired_completed()
+            self._schedule_expiry()
+
+    @staticmethod
+    async def _drain_cleanup(coroutine):
+        """Repeated stop/cancel requests must not abandon terminal cleanup."""
+        cleanup = asyncio.create_task(coroutine)
+        while True:
+            try:
+                return await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                if cleanup.done():
+                    return cleanup.result()
+
+    async def _release_task_resources(self, task: ChatTask) -> None:
+        """Keep replay data, not the complete agent and persistence buffers."""
+        node = task.node
+        if node is not None:
+            task.llm_session_id = node.session_id
+            close = getattr(type(node), "aclose", None)
+            if close is not None:
+                try:
+                    await close(node)
+                except Exception:
+                    logger.exception("Failed to release chat node for %s", task.session_id)
+        task.node = None
+        task.message_contents.clear()
+        task.tool_result_contents.clear()
+        task.content_events.clear()
+        task.pending_input_queue.drain()
+        task.on_turn_end = None
+        task.stats_context.clear()
+        task.live_permission_profile = None
+
+    def _schedule_expiry(self) -> None:
+        if self._expiry_handle is not None:
+            self._expiry_handle.cancel()
+            self._expiry_handle = None
+        deadlines = [
+            t.completed_at + self._completed_task_ttl
+            for t in self._completed_tasks.values()
+            if t.completed_at is not None
+        ]
+        if deadlines:
+            delay = max(0, min(deadlines) - self._clock())
+            self._expiry_handle = asyncio.get_running_loop().call_later(delay, self._expire_completed)
+
+    def _expire_completed(self) -> None:
+        self._expiry_handle = None
+        self._purge_expired_completed()
+        self._schedule_expiry()
 
     @staticmethod
     def _settle_turn(task: ChatTask, last_usage: Any) -> None:
@@ -1553,7 +1682,7 @@ class ChatTaskManager:
         base_dir = getattr(agent_config, "session_dir", None) or str(
             get_path_manager(agent_config=agent_config).sessions_dir
         )
-        return SessionManager(session_dir=base_dir, scope=user_id)
+        return SessionManager(session_dir=base_dir, scope=session_user_scope(agent_config, user_id))
 
     # Preserve the internal name for existing subclasses; hosts use session_manager.
     _session_manager = session_manager
@@ -1628,16 +1757,28 @@ class ChatTaskManager:
         logger.debug(f"Pushing event: {event}")
         async with task.condition:
             task.events.append(event)
+            if self._max_completed_bytes is not None:
+                task.replay_bytes += len(event.model_dump_json().encode("utf-8"))
             task.condition.notify_all()
 
     def _purge_expired_completed(self) -> None:
         """Remove completed tasks older than COMPLETED_TASK_TTL."""
-        now = datetime.now()
+        now = self._clock()
         expired = [
-            sid for sid, t in self._completed_tasks.items() if (now - t.created_at).total_seconds() > COMPLETED_TASK_TTL
+            sid
+            for sid, t in self._completed_tasks.items()
+            if t.completed_at is not None and now - t.completed_at >= self._completed_task_ttl
         ]
         for sid in expired:
             self._completed_tasks.pop(sid, None)
+        if self._max_completed_tasks is not None:
+            while len(self._completed_tasks) > self._max_completed_tasks:
+                self._completed_tasks.pop(next(iter(self._completed_tasks)))
+        if self._max_completed_bytes is not None:
+            total = sum(t.replay_bytes for t in self._completed_tasks.values())
+            while self._completed_tasks and total > self._max_completed_bytes:
+                task = self._completed_tasks.pop(next(iter(self._completed_tasks)))
+                total -= task.replay_bytes
 
     # ------------------------------------------------------------------
     # Node factory

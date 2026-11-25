@@ -470,6 +470,41 @@ _REVENUE_TEMPLATE = (
 
 
 class TestSaveQueryTemplate:
+    def test_preserves_mixed_sqlite_values(self, dashboard_tools: DashboardArtifactTools):
+        result = dashboard_tools.save_query_template(
+            name="mixed_values",
+            sql_template=(
+                "-- @datus-params value:integer\n"
+                "SELECT :value AS value, X'6f6b' AS detail UNION ALL SELECT 'unknown', X'ff'"
+            ),
+            sample_params={"value": 7},
+            goal="Inspect mixed data values",
+            hypothesis="The query returns a number and a status in the same column.",
+        )
+
+        assert result.success == 1, result.error
+        assert result.result["preview_rows"] == [
+            {"value": 7, "detail": "ok"},
+            {"value": "unknown", "detail": "ff"},
+        ]
+
+    def test_saves_projection_when_sample_filters_match_no_rows(
+        self, dashboard_tools: DashboardArtifactTools, project_root: Path
+    ):
+        result = dashboard_tools.save_query_template(
+            name="unmatched_revenue",
+            sql_template=_REVENUE_TEMPLATE,
+            sample_params={"month_floor": "2027-01"},
+            goal="Revenue by region in the selected period",
+            hypothesis="No regions have recorded revenue in that period.",
+        )
+
+        assert result.success == 1, result.error
+        assert result.result["preview_rows"] == []
+        saved = json.loads((project_root / result.result["params_path"]).read_text(encoding="utf-8"))
+        assert saved["sample_row_count"] == 0
+        assert [column["name"] for column in saved["columns"]] == ["region", "revenue"]
+
     def test_persists_sql_and_params_json(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
         result = dashboard_tools.save_query_template(
             name="revenue_by_region",
@@ -1452,6 +1487,97 @@ def test_template_save_keeps_query_source_authoritative_until_finalize(dashboard
     root = project_root / "dashboards" / dashboard_tools.dashboard_slug
     query = json.loads((root / "queries/source_owner.params.json").read_text())
     manifest = json.loads((root / "manifest.json").read_text())
-    assert query["datasource"] == "default"
-    assert manifest["datasources"] == []
+    assert query["datasource_id"] == "default"
+    assert manifest.get("datasources", []) == []
     assert manifest["updated_at"] == query["saved_at"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("published", [False, True])
+async def test_saved_dashboard_executes_after_rename_without_rewriting_bundle(dashboard_tools, monkeypatch, published):
+    """Exercise the real SQL saver and reader with a renamed runtime connection."""
+    import json
+    from types import SimpleNamespace
+
+    from datus.api.models.base_models import Result
+    from datus.api.services.dashboard_service import DashboardService
+    from datus.configuration.agent_config import _parse_single_file_db
+    from datus.tools import func_tool
+
+    tool = dashboard_tools._db_func_tool
+    entry = _parse_single_file_db({"uri": ":memory:", "datasource_id": "stable"}, "sqlite")
+    cfg = SimpleNamespace(services=SimpleNamespace(datasources={"default": entry}))
+    tool.agent_config = cfg
+    saved = dashboard_tools.save_query_template(
+        name="rename",
+        sql_template="-- @datus-params\nSELECT 42 AS answer",
+        goal="Answer",
+        hypothesis="Stable identity",
+        sample_params={},
+    )
+    assert saved.success == 1, saved.error
+    root = dashboard_tools.queries_dir
+    sql = (root / "rename.sql.j2").read_text()
+    before = (root / "rename.params.json").read_bytes()
+    meta = json.loads(before)
+    assert meta["datasource_id"] == "stable"
+    assert "datasource" not in meta and "datasource" not in meta["execution_context"]
+    cfg.services.datasources = {"renamed": entry}
+    connector = tool._primary_connector
+    seen = []
+
+    def resolve(context):
+        seen.append(context)
+        return connector
+
+    tool.connector_for_execution_context = resolve
+    monkeypatch.setattr(func_tool, "DBFuncTool", lambda **kwargs: tool)
+
+    async def loader(version):
+        assert version == 1
+        return Result(success=True, data=(sql, before.decode()))
+
+    result = await DashboardService(agent_config=cfg).run_query(
+        project_files_root=dashboard_tools._project_root,
+        dashboard_slug=dashboard_tools.dashboard_slug,
+        query_slug="rename",
+        params={},
+        published_version=1 if published else None,
+        published_template_loader=loader if published else None,
+    )
+    assert result.success is True, result.errorMessage
+    assert result.data.rows == [{"answer": 42}]
+    assert seen[0]["datasource"] == "renamed"
+    assert (root / "rename.params.json").read_bytes() == before
+
+
+@pytest.mark.ci
+@pytest.mark.parametrize("selection", ["single", "default", "explicit"])
+@pytest.mark.parametrize("stable_id", ["", "stable-warehouse"])
+def test_single_connector_save_resolves_configured_identity(dashboard_tools, selection, stable_id):
+    """Default saves use a configured source while explicit overrides remain authoritative."""
+    import json
+
+    from datus.configuration.agent_config import DbConfig, ServicesConfig
+
+    entries = {"warehouse": DbConfig(type="sqlite", datasource_id=stable_id, default=selection != "single")}
+    if selection != "single":
+        entries["secondary"] = DbConfig(type="sqlite", datasource_id="stable-secondary")
+    tool = dashboard_tools._db_func_tool
+    tool.agent_config = SimpleNamespace(services=ServicesConfig(datasources=entries))
+    assert tool._default_datasource == ""
+    source = "secondary" if selection == "explicit" else ""
+    result = dashboard_tools.save_query_template(
+        name="configured",
+        sql_template="-- @datus-params\nSELECT 42 AS answer",
+        sample_params={},
+        datasource=source,
+        goal="Read the answer",
+        hypothesis="The answer is 42",
+    )
+    assert result.success == 1, result.error
+    payload = json.loads((dashboard_tools.queries_dir / "configured.params.json").read_text())
+    expected = "stable-secondary" if source else stable_id or "warehouse"
+    assert payload["datasource_id"] == expected
+    assert payload["execution_context"]["datasource_id"] == expected
+    assert "datasource" not in payload

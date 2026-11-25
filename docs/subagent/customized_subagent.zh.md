@@ -1,5 +1,7 @@
 # 自定义 Subagent
 
+通用配置、自定义 skills/tools/MCP/`scoped_context` 访问范围，以及私有插件 runtime，请参阅 [Configurable subagents](configurable_subagent.md)。以下 TUI 流程继续用于现有类型的自定义 agent。
+
 ## 概览
 
 `/agent` 和 `/subagent` 都会打开**统一的 agent 管理 TUI**，内含两个 Tab：
@@ -17,8 +19,6 @@
 
 1. `agent.agentic_nodes` 下的新配置项
 2. 一个名为 `{agent_name}_system_{prompt_version}.j2` 的提示词模板文件
-
-`gen_report` 已移除。旧配置引用它时会直接报 subagent 不存在，并提示使用 `gen_visual_report`。
 
 当前向导支持三类自定义节点：
 

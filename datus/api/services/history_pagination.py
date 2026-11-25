@@ -4,7 +4,6 @@ Cursors address persisted SQLite rows, never process-local caches, so requests
 can move between replicas sharing the session volume. Model input is untouched.
 """
 
-import ast
 import base64
 import hashlib
 import json
@@ -16,7 +15,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 from datus.api.models.cli_models import ChatHistoryPageData
+from datus.models.history_archive import (
+    TASK_CALL_SHADOWED,
+    TASK_CHILD_UNAVAILABLE,
+    Anchor,
+    HistoryArchive,
+    HistoryArchiveReadError,
+    prompt_anchor,
+    task_child_session_id,
+)
 from datus.models.session_manager import SessionManager, extract_user_input, is_compact_resume_text
+from datus.utils.artifact_output import session_user_scope
 
 if TYPE_CHECKING:
     from datus.api.services.chat_service import ChatService
@@ -57,71 +66,99 @@ def _connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _parse_output(raw: Any) -> Any:
-    if not isinstance(raw, str):
-        return raw
-    try:
-        return json.loads(raw)
-    except ValueError:
-        try:
-            return ast.literal_eval(raw)
-        except (ValueError, SyntaxError):
-            return raw
-
-
-def subagent_run_offsets(manager: SessionManager, session_id: str, start_id: int) -> dict[str, int]:
-    """Skip a reused child's runs belonging to task calls on earlier pages."""
-    with _connect(_db_path(manager, session_id)) as conn:
-        rows = conn.execute(
-            "SELECT json_extract(o.message_data, '$.output') FROM agent_messages o "
-            "WHERE o.session_id=? AND o.id<? AND json_extract(o.message_data, '$.type')='function_call_output' "
-            "AND json_extract(o.message_data, '$.call_id') IN ("
-            "SELECT json_extract(c.message_data, '$.call_id') FROM agent_messages c "
-            "WHERE c.session_id=? AND c.id<? "
-            "AND json_extract(c.message_data, '$.type')='function_call' "
-            "AND json_extract(c.message_data, '$.name')='task') ORDER BY o.id",
-            (session_id, start_id, session_id, start_id),
-        )
-        native_rows = conn.execute(
-            "SELECT json_extract(r.value,'$.content') FROM agent_messages m, json_each(m.message_data,'$.content') r "
-            "WHERE m.session_id=? AND m.id<? AND json_extract(m.message_data,'$.role')='user' "
-            "AND r.type='object' AND json_extract(r.value,'$.type')='tool_result' "
-            "AND json_extract(r.value,'$.tool_use_id') IN ("
-            "SELECT json_extract(t.value,'$.id') FROM agent_messages c,json_each(c.message_data,'$.content') t "
-            "WHERE c.session_id=? AND c.id<? AND t.type='object' "
-            "AND json_extract(t.value,'$.name')='task')",
-            (session_id, start_id, session_id, start_id),
-        )
+def subagent_run_offsets(manager: SessionManager, session_id: str, start_id: int) -> dict[str, int] | None:
+    """Count earlier child runs, or return None if an earlier result cannot be attributed."""
+    path = _db_path(manager, session_id)
+    with _connect(path) as conn:
+        conn.execute("BEGIN")
+        archive = HistoryArchive(conn, path, session_id)
         counts: Counter[str] = Counter()
-        for records in (rows, native_rows):
-            for (raw,) in records:
-                output = _parse_output(raw)
-                if isinstance(output, list):
-                    output = _parse_output(
-                        "\n".join(str(block.get("text", "")) for block in output if isinstance(block, dict))
+        indexed_events = ""
+        if archive.hidden_through:
+            counts.update(
+                dict(
+                    conn.execute(
+                        "SELECT child_id,COUNT(*) FROM chat_history_tasks "
+                        "WHERE session_id=? AND message_id<? AND child_id NOT IN ('',?,?) GROUP BY child_id",
+                        (session_id, start_id, TASK_CHILD_UNAVAILABLE, TASK_CALL_SHADOWED),
                     )
-                if isinstance(output, dict):
-                    result = _parse_output(output.get("result", output))
-                    child = result.get("session_id") if isinstance(result, dict) else None
-                    if isinstance(child, str) and SessionManager._SESSION_ID_RE.fullmatch(child) and ".." not in child:
-                        counts[child] += 1
+                )
+            )
+            indexed_events = (
+                " UNION ALL SELECT message_id,-1,call_id,child_id IS NULL AND (message_id,call_id) NOT IN ("
+                "SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(:settled_calls)"
+                "),NULL FROM chat_history_tasks "
+                "WHERE session_id=:session AND message_id<:before AND call_id!=''"
+            )
+
+        def task_outputs() -> Iterator[Any]:
+            # A legacy result or superseding call closes only that indexed occurrence.
+            settled_calls = []
+            for row_id, call_id, tool_name, output in archive.unindexed_task_events(start_id):
+                settled_calls.append((row_id, call_id))
+                if tool_name is None:
+                    yield output
+            # Match each result to the preceding event for its call ID. Keep result
+            # bodies out of the ordering step and extract only those paired to a task.
+            rows = conn.execute(
+                "WITH live AS (SELECT id,message_data FROM agent_messages "
+                "WHERE session_id=:session AND id>:hidden AND id<:before), "
+                "events(id,position,call_id,task_call,output_path) AS ("
+                "SELECT id,-1,json_extract(message_data,'$.call_id'),"
+                "json_extract(message_data,'$.type')='function_call' AND json_extract(message_data,'$.name')='task',"
+                "CASE WHEN json_extract(message_data,'$.type')='function_call_output' THEN '$.output' END "
+                "FROM live WHERE json_extract(message_data,'$.type') IN ('function_call','function_call_output') "
+                "UNION ALL SELECT live.id,CAST(b.key AS INTEGER),"
+                "CASE WHEN json_extract(b.value,'$.type')='tool_use' THEN json_extract(b.value,'$.id') "
+                "ELSE json_extract(b.value,'$.tool_use_id') END,"
+                "json_extract(b.value,'$.type')='tool_use' AND json_extract(b.value,'$.name')='task',"
+                "CASE WHEN json_extract(b.value,'$.type')='tool_result' THEN '$.content['||b.key||'].content' END "
+                "FROM live,json_each(message_data,'$.content') b "
+                "WHERE b.type='object' AND json_type(message_data,'$.content')='array' AND ("
+                "(json_extract(message_data,'$.role')='assistant' AND json_extract(b.value,'$.type')='tool_use') OR "
+                "(json_extract(message_data,'$.role')='user' AND json_extract(b.value,'$.type')='tool_result'))"
+                + indexed_events
+                + "), paired AS ("
+                "SELECT id,output_path,LAG(task_call) OVER (PARTITION BY call_id ORDER BY id,position) AS after_task "
+                "FROM events WHERE call_id IS NOT NULL AND call_id!='') "
+                "SELECT json_extract(live.message_data,paired.output_path) FROM paired "
+                "JOIN live ON live.id=paired.id WHERE paired.after_task AND paired.output_path IS NOT NULL",
+                {
+                    "session": session_id,
+                    "hidden": archive.hidden_through or 0,
+                    "before": start_id,
+                    "settled_calls": json.dumps(settled_calls),
+                },
+            )
+            yield from (raw for (raw,) in rows)
+
+        archive_dir = Path(manager.session_dir).resolve() / session_id / "data"
+        try:
+            for raw in task_outputs():
+                child = task_child_session_id(raw, archive_dir=archive_dir)
+                if child == TASK_CHILD_UNAVAILABLE:
+                    return None
+                if child:
+                    counts[child] += 1
+        except HistoryArchiveReadError:
+            # Off-page task data only affects whether child runs can be attributed.
+            return None
         return dict(counts)
 
 
 def _user_turn_rows(
-    conn: sqlite3.Connection, session_id: str, snapshot: int, *, descending: bool = False
+    conn: sqlite3.Connection, session_id: str, snapshot: int, *, after: int = 0
 ) -> Iterator[tuple[int, str]]:
     # Exclude native tool-result bodies in SQLite before returning user prompts.
     rows = conn.execute(
-        "SELECT id,message_data FROM agent_messages WHERE session_id=? AND id<=? "
+        "SELECT id,message_data FROM agent_messages WHERE session_id=? AND id>? AND id<=? "
         "AND json_extract(message_data,'$.role')='user' AND ("
         "json_type(message_data,'$.content')!='array' OR "
         "NOT EXISTS(SELECT 1 FROM json_each(message_data,'$.content') "
         "WHERE type='object' AND json_extract(value,'$.type')='tool_result') "
         "OR EXISTS(SELECT 1 FROM json_each(message_data,'$.content') "
-        "WHERE type='object' AND json_extract(value,'$.type') IN ('text','input_text','output_text'))) ORDER BY id "
-        + ("DESC" if descending else "ASC"),
-        (session_id, snapshot),
+        "WHERE type='object' AND json_extract(value,'$.type') IN ('text','input_text','output_text'))) ORDER BY id",
+        (session_id, after, snapshot),
     )
     for row_id, raw in rows:
         content = extract_user_input(json.loads(raw).get("content", ""))
@@ -129,27 +166,30 @@ def _user_turn_rows(
             yield row_id, raw
 
 
+def _turn_anchors(archive: HistoryArchive, snapshot: int) -> Iterator[Anchor]:
+    yield from archive.archived_anchors(snapshot)
+    for row_id, raw in _user_turn_rows(archive.conn, archive.session_id, snapshot, after=archive.hidden_through or 0):
+        anchor = prompt_anchor(row_id, raw)
+        if anchor is not None:
+            yield anchor
+
+
 def subagent_run_window(manager: SessionManager, session_id: str, skip: int, count: int) -> Optional[tuple[int, int]]:
     """Resolve prompt boundaries without fetching off-page tool bodies."""
-    with _connect(_db_path(manager, session_id)) as conn:
-        snapshot = conn.execute(
-            "SELECT COALESCE(MAX(id),0) FROM agent_messages WHERE session_id=?", (session_id,)
-        ).fetchone()[0]
-        turns = _user_turn_rows(conn, session_id, snapshot)
-        first = next(turns, None)
-        # Legacy/compacted sessions can start with an implicit assistant run.
-        prefix = conn.execute(
-            "SELECT id FROM agent_messages WHERE session_id=? AND id<? AND ("
-            "json_extract(message_data,'$.type')='function_call' OR ("
-            "json_extract(message_data,'$.role')='assistant' AND EXISTS("
-            "SELECT 1 FROM json_each(message_data,'$.content') b WHERE b.type='object' AND ("
-            "json_extract(b.value,'$.type') IN ('tool_use','server_tool_use') OR ("
-            "json_extract(b.value,'$.type') IN ('text','output_text') "
-            "AND json_extract(b.value,'$.text')!=''))))) ORDER BY id LIMIT 1",
-            (session_id, first[0] if first else snapshot + 1),
-        ).fetchone()
-        starts = chain([(prefix[0], "")] if prefix else [], [first] if first else [], turns)
-        markers = [row_id for row_id, _ in islice(starts, skip, skip + count + 1)]
+    path = _db_path(manager, session_id)
+    with _connect(path) as conn:
+        conn.execute("BEGIN")
+        archive = HistoryArchive(conn, path, session_id)
+        snapshot = archive.snapshot()
+        anchors = _turn_anchors(archive, snapshot)
+        first = next(anchors, None)
+        prefix = archive.implicit_run_start(first[0] if first else snapshot + 1)
+        starts = chain(
+            [prefix] if prefix is not None else [],
+            [first[0]] if first else [],
+            (anchor[0] for anchor in anchors),
+        )
+        markers = list(islice(starts, skip, skip + count + 1))
         if not markers:
             return None
         return markers[0], markers[count] - 1 if len(markers) > count else snapshot
@@ -158,9 +198,9 @@ def subagent_run_window(manager: SessionManager, session_id: str, skip: int, cou
 def _window(manager: SessionManager, session_id: str, limit: int, cursor: Optional[str], turn: Optional[int]):
     path = _db_path(manager, session_id)
     with _connect(path) as conn:
-        snapshot = conn.execute(
-            "SELECT COALESCE(MAX(id),0) FROM agent_messages WHERE session_id=?", (session_id,)
-        ).fetchone()[0]
+        conn.execute("BEGIN")
+        archive = HistoryArchive(conn, path, session_id)
+        snapshot = archive.snapshot()
         before = snapshot + 1
         if cursor and turn is not None:
             raise ValueError("Use either a cursor or a target turn")
@@ -171,12 +211,9 @@ def _window(manager: SessionManager, session_id: str, limit: int, cursor: Option
             before, snapshot = saved.get("before"), saved.get("snapshot")
             if type(before) is not int or type(snapshot) is not int or not 1 <= before <= snapshot:
                 raise ValueError("Invalid history cursor")
-            anchor = conn.execute(
-                "SELECT message_data FROM agent_messages WHERE session_id=? AND id=?", (session_id, before)
-            ).fetchone()
-            if not anchor or hashlib.sha256(anchor[0].encode()).hexdigest() != saved.get("anchor"):
-                raise HistoryChangedError("History changed; reload the latest messages")
-        turns = list(_user_turn_rows(conn, session_id, snapshot, descending=True))
+        turns = list(reversed(list(_turn_anchors(archive, snapshot))))
+        if cursor and not any(row_id == before and digest == saved.get("anchor") for row_id, digest, _, _ in turns):
+            raise HistoryChangedError("History changed; reload the latest messages")
         total = len(turns)
         if turn is not None:
             if not 1 <= turn <= total:
@@ -189,8 +226,8 @@ def _window(manager: SessionManager, session_id: str, limit: int, cursor: Option
             selected = [row for row in turns if row[0] < before][:limit]
         if not selected:
             return ((1, snapshot) if not cursor and snapshot else None), False, None, total, []
-        first_id, first_raw = selected[-1]
-        indices = {row_id: total - index for index, (row_id, _) in enumerate(turns)}
+        first_id, first_digest, _, _ = selected[-1]
+        indices = {row[0]: total - index for index, row in enumerate(turns)}
         has_more = indices[first_id] > 1
         next_cursor = (
             _encode(
@@ -199,7 +236,7 @@ def _window(manager: SessionManager, session_id: str, limit: int, cursor: Option
                     "s": session_id,
                     "before": first_id,
                     "snapshot": snapshot,
-                    "anchor": hashlib.sha256(first_raw.encode()).hexdigest(),
+                    "anchor": first_digest,
                 }
             )
             if has_more
@@ -209,9 +246,9 @@ def _window(manager: SessionManager, session_id: str, limit: int, cursor: Option
             {
                 "message_id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{session_id}:{row_id}")),
                 "index": indices[row_id],
-                "text": extract_user_input(json.loads(raw).get("content", ""))[:160],
+                "text": text,
             }
-            for row_id, raw in reversed(selected)
+            for row_id, _, text, _ in reversed(selected)
         ]
         return (first_id, min(snapshot, before - 1)), has_more, next_cursor, total, anchors
 
@@ -281,7 +318,7 @@ def get_history_page(
 ):
     page_size = limit if limit is not None else 10
     inline_limit = inline_chars
-    manager = SessionManager(session_dir=service._session_dir, scope=user_id)
+    manager = SessionManager(session_dir=service._session_dir, scope=session_user_scope(service.agent_config, user_id))
     try:
         window, has_more, next_cursor, total_turns, turns = _window(manager, session_id, page_size, cursor, turn)
     except FileNotFoundError:
@@ -356,7 +393,7 @@ def get_history_content(service: "ChatService", session_id: str, user_id: Option
         raise ValueError("Invalid tool content reference")
     if not 1 <= start <= end or not 0 <= index < 100000:
         raise ValueError("Invalid tool content reference")
-    manager = SessionManager(session_dir=service._session_dir, scope=user_id)
+    manager = SessionManager(session_dir=service._session_dir, scope=session_user_scope(service.agent_config, user_id))
     _db_path(manager, session_id)
     history = service.get_history(session_id, user_id, window=(start, end))
     if not history.success or history.data is None:

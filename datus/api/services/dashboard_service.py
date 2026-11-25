@@ -46,6 +46,7 @@ from datus.schemas.metric_artifact_query import MetricQueryFile
 from datus.tools.func_tool.dashboard_artifact_tools import render_dashboard_template
 from datus.tools.func_tool.report_artifact_tools import _normalize_value
 from datus.utils.artifact_files import iter_artifact_files
+from datus.utils.artifact_output import artifact_output_root
 from datus.utils.exceptions import ErrorCode
 from datus.utils.loggings import get_logger
 from datus.utils.metric_artifact_models import resolve_metric_query_snapshot
@@ -376,6 +377,8 @@ class DashboardService:
             execute_published_metric_query,
         )
         from datus.tools.func_tool.semantic_tools import SemanticTools
+        from datus.tools.semantic_tools.dosi.errors import SemanticValidationException
+        from datus.tools.semantic_tools.exceptions import SemanticCoreException
 
         if (
             query.name != meta.slug
@@ -393,9 +396,17 @@ class DashboardService:
                 db_tool = func_tool_mod.DBFuncTool(
                     agent_config=self.agent_config, sub_agent_name="gen_visual_dashboard"
                 )
+                source_root = Path(self.agent_config.project_root).resolve()
+                use_snapshot = (
+                    published or query.use_model_snapshot or artifact_output_root(self.agent_config) != source_root
+                )
+                model_path = (source_root / query.model_path).resolve()
+                if not model_path.is_relative_to(source_root):
+                    raise ValueError("metric model path escapes project")
                 semantic_tools = SemanticTools(
                     agent_config=self.agent_config,
                     sub_agent_name="gen_visual_dashboard",
+                    semantic_model_path_provider=None if use_snapshot else (lambda: str(model_path)),
                     runtime_db_context_provider=lambda: query.execution_context or {"datasource": query.datasource},
                     policy_context_provider=lambda: (
                         policy_context
@@ -403,10 +414,28 @@ class DashboardService:
                         else getattr(self.agent_config, "policy_context", None) or {}
                     ),
                 )
-                if published:
+                if not use_snapshot and query.model_snapshot is not None:
+                    # A shared connection can resolve in the importing project
+                    # even when its project model (or this metric) cannot.
+                    runtime = semantic_tools.runtime if model_path.is_file() else None
+                    if runtime is None:
+                        use_snapshot = True
+                    else:
+                        try:
+                            binding = runtime.artifact_metric_binding(query.metric.name)
+                            use_snapshot = Path(binding["model_path"]).resolve() != model_path
+                        except (OSError, SemanticCoreException, SemanticValidationException):
+                            use_snapshot = True
+                if use_snapshot:
+                    # The local loader hydrates the artifact-owned model snapshot.
+                    # Builder files do not share the context root used by IDE preview.
                     return execute_published_metric_query(
-                        query,
-                        runtime_config=semantic_tools.runtime.config,
+                        (
+                            resolve_metric_query_snapshot(query)
+                            if query.model_snapshot is not None and query.model_snapshot_path is None
+                            else query
+                        ),
+                        runtime_config=semantic_tools.runtime_connection_config(),
                         db_tool=db_tool,
                         params=params,
                         policy_context=policy_context,
@@ -415,7 +444,7 @@ class DashboardService:
                     query,
                     semantic_tools=semantic_tools,
                     db_tool=db_tool,
-                    project_root=Path(self.agent_config.project_root),
+                    project_root=source_root,
                     params=params,
                     policy_context=policy_context,
                     saved=query,
@@ -516,6 +545,15 @@ class DashboardService:
                 errorCode="INVALID_PARAMS",
                 errorMessage=str(exc),
             )
+
+        from datus.utils.artifact_datasource import runtime_artifact_query
+
+        try:
+            meta = runtime_artifact_query(self.agent_config, meta)
+            if isinstance(sql_template, MetricQueryFile):
+                sql_template = runtime_artifact_query(self.agent_config, sql_template)
+        except ValueError as exc:
+            return Result(success=False, errorCode="DATASOURCE_UNAVAILABLE", errorMessage=str(exc))
 
         if isinstance(sql_template, MetricQueryFile):
             return await self._run_metric_query(

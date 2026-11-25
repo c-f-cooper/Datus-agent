@@ -292,7 +292,8 @@ class TestConstants:
             "semantic_tools.get_metric",
             "semantic_tools.get_dataset",
             "semantic_tools.query_metrics",
-            "semantic_tools.attribution_analyze",
+            "semantic_tools.attribute_metrics",
+            "semantic_tools.attribute_dimensions",
             "context_search_tools.list_subject_tree",
             "filesystem_tools.read_file",
             "filesystem_tools.glob",
@@ -325,7 +326,8 @@ class TestConstants:
             "semantic_tools.get_dataset",
             "semantic_tools.query_metrics",
             "semantic_tools.get_query_metrics_result",
-            "semantic_tools.attribution_analyze",
+            "semantic_tools.attribute_metrics",
+            "semantic_tools.attribute_dimensions",
             "db_tools.*",
             "context_search_tools.*",
             "reference_template_tools.*",
@@ -356,9 +358,9 @@ class TestConstants:
         assert "describe_table" in VALID_TOOL_METHODS["db_tools"]
 
     @pytest.mark.parametrize("agent_type", list(SUBAGENT_TOOL_REFERENCE))
-    def test_cached_metric_reader_is_configurable_only_for_chat(self, agent_type):
+    def test_cached_metric_reader_is_configurable_for_chat_and_analytics(self, agent_type):
         reader = "semantic_tools.get_query_metrics_result"
-        expected = [] if agent_type == "chat" else [reader]
+        expected = [] if agent_type in {"chat", "analytics_explorer", "analytics_builder"} else [reader]
         assert _validate_tools([reader]) == []
         assert _validate_tools_for_agent_type([reader], agent_type) == expected
 
@@ -516,7 +518,11 @@ class TestPerAgentTypeCategoryWhitelist:
             for category in categories:
                 payload = tool_types[category]
                 assert set(payload.keys()) == {"tools"}
-                if agent_type in {"ask_report", "ask_dashboard"} and category == "filesystem_tools":
+                if agent_type in {"analytics_explorer", "analytics_builder"}:
+                    from datus.tools.registry.subagent_policy import tool_reference
+
+                    assert payload == tool_reference(agent_type)["tool_types"][category]
+                elif agent_type in {"ask_report", "ask_dashboard"} and category == "filesystem_tools":
                     # ask_* filesystem is the read-only subset — write tools
                     # must be absent and the read trio must be present.
                     assert set(payload["tools"]) == set(_ASK_AGENT_FILESYSTEM_READ_ONLY)
@@ -843,19 +849,16 @@ class TestGetAgent:
 class TestCreateAgent:
     """Tests for create_agent — agent creation with YAML persistence."""
 
-    @pytest.mark.parametrize("name,node_class", [("legacy_report", "gen_report"), ("gen_report", "gen_sql")])
-    async def test_removed_report_type_returns_migration_error(
-        self, real_agent_config, agent_yml_with_singleton, name, node_class
-    ):
+    async def test_unknown_type_is_rejected_before_persistence(self, real_agent_config, agent_yml_with_singleton):
         from datus.api.models.agent_models import CreateAgentInput
 
         original_config = agent_yml_with_singleton.read_text(encoding="utf-8")
-        result = await AgentService().create_agent(CreateAgentInput(name=name, type=node_class), real_agent_config)
+        request = CreateAgentInput(name="custom_agent", type="unknown_type")
+        result = await AgentService().create_agent(request, real_agent_config)
 
         assert result.success is False
         assert result.errorCode == "INVALID_AGENT_TYPE"
-        assert "Subagent 'gen_report' does not exist" in result.errorMessage
-        assert "Use 'gen_visual_report' instead" in result.errorMessage
+        assert "Unknown subagent type 'unknown_type'" in result.errorMessage
         assert agent_yml_with_singleton.read_text(encoding="utf-8") == original_config
 
     async def test_create_agent_success(self, real_agent_config, agent_yml_with_singleton):
@@ -1008,6 +1011,41 @@ class TestCreateAgent:
         # The raw API field name must NOT be persisted — that would be invisible
         # to the runtime.
         assert "description" not in entry
+
+    async def test_create_and_edit_agent_save_a_replaced_tool_as_its_successors(
+        self, real_agent_config, agent_yml_with_singleton
+    ):
+        """A client still sending ``semantic_tools.attribution_analyze`` is not rejected:
+        the name is validated and saved as the two tools that replaced it."""
+        import yaml
+
+        from datus.api.models.agent_models import CreateAgentInput, EditAgentInput
+
+        def saved_tools(name):
+            raw = yaml.safe_load(agent_yml_with_singleton.read_text(encoding="utf-8"))
+            tools = raw["agent"]["agentic_nodes"][name]["tools"]
+            return [t.strip() for t in tools.split(",")] if isinstance(tools, str) else tools
+
+        svc = AgentService()
+        created = await svc.create_agent(
+            CreateAgentInput(name="legacy_attr", type="gen_sql", tools=["semantic_tools.attribution_analyze"]),
+            real_agent_config,
+        )
+        assert created.success is True, created.errorMessage
+        assert saved_tools("legacy_attr") == ["semantic_tools.attribute_metrics", "semantic_tools.attribute_dimensions"]
+
+        edited = await svc.edit_agent(
+            EditAgentInput(
+                id="legacy_attr", tools=["semantic_tools.query_metrics", "semantic_tools.attribution_analyze"]
+            ),
+            real_agent_config,
+        )
+        assert edited.success is True, edited.errorMessage
+        assert saved_tools("legacy_attr") == [
+            "semantic_tools.query_metrics",
+            "semantic_tools.attribute_metrics",
+            "semantic_tools.attribute_dimensions",
+        ]
 
     async def test_create_agent_invalid_tools_fails(self, real_agent_config, agent_yml_with_singleton):
         """create_agent rejects invalid tool patterns."""

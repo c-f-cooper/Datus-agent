@@ -12,6 +12,7 @@ import uuid
 from collections import Counter
 from functools import lru_cache
 from importlib.resources import files
+from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
 from datus.agent.node.chat_agentic_node import ChatAgenticNode
@@ -34,6 +35,7 @@ from datus.api.services.action_sse_converter import (
     action_to_sse_event,
     answered_ask_user_to_sse_event,
 )
+from datus.api.services.chat_extensions import ChatToolBinder
 from datus.api.services.chat_task_manager import (
     TurnEndCallback,
     _is_visible_assistant_response,
@@ -43,8 +45,10 @@ from datus.api.services.chat_task_manager import (
 )
 from datus.api.services.turn_stats import resolve_subagent
 from datus.configuration.agent_config import AgentConfig
+from datus.models.history_archive import TASK_CHILD_UNAVAILABLE, HistoryArchiveReadError, task_child_session_id
 from datus.models.session_manager import SessionManager, extract_agent_from_session_id, session_matches_agent
 from datus.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+from datus.utils.artifact_output import session_user_scope
 from datus.utils.config_utils import coerce_positive_int
 from datus.utils.exceptions import DatusException, ErrorCode
 from datus.utils.loggings import get_logger
@@ -79,18 +83,6 @@ def _is_task_result(action: ActionHistory) -> bool:
     )
 
 
-def _subagent_session_id(result_action: ActionHistory) -> Optional[str]:
-    output = result_action.output if isinstance(result_action.output, dict) else {}
-    result = output.get("result", output)
-    if isinstance(result, str):
-        try:
-            result = json.loads(result)
-        except (TypeError, ValueError):
-            return None
-    sub_session_id = result.get("session_id") if isinstance(result, dict) else None
-    return sub_session_id if isinstance(sub_session_id, str) and sub_session_id else None
-
-
 def _is_safe_session_id(session_id: str) -> bool:
     try:
         SessionManager._validate_session_id(session_id)
@@ -117,7 +109,9 @@ def _load_subagent_runs(
             if window is None:
                 return []
             bounds = {"min_id": window[0], "max_id": window[1]}
-        raw_messages = manager.get_session_messages(sub_session_id, **bounds)
+        raw_messages = manager.get_session_messages(sub_session_id, include_archive=True, **bounds)
+    except HistoryArchiveReadError:
+        raise
     except Exception as e:
         logger.warning(f"Failed to read subagent session {sub_session_id} for history: {e}")
         return []
@@ -137,7 +131,7 @@ def _load_subagent_runs(
 def _subagent_run_actions(
     session_dir: str,
     call_id: str,
-    result_action: ActionHistory,
+    sub_session_id: str | None,
     runs_cache: Dict[str, List[List[ActionHistory]]],
     agent_config: Any = None,
     node_responses: Optional[Dict[str, dict]] = None,
@@ -148,8 +142,7 @@ def _subagent_run_actions(
     session, inside the user's scope. A resumed session holds several runs, and each
     ``task`` result takes the next one; ``runs_cache`` reads each session once per request.
     """
-    sub_session_id = _subagent_session_id(result_action)
-    if not sub_session_id or not _is_safe_session_id(sub_session_id):
+    if not sub_session_id:
         return []
     if sub_session_id not in runs_cache:
         runs_cache[sub_session_id] = _load_subagent_runs(session_dir, sub_session_id)
@@ -342,6 +335,8 @@ class ChatService:
         policy_context: Optional[Dict[str, Any]] = None,
         stats_context: Optional[Dict[str, Any]] = None,
         on_turn_end: Optional[TurnEndCallback] = None,
+        *,
+        tool_binder: ChatToolBinder | None = None,
     ) -> AsyncGenerator[SSEEvent, None]:
         """Start a background chat task and yield SSE events."""
         task_manager = self._task_manager
@@ -354,6 +349,7 @@ class ChatService:
                 policy_context=policy_context,
                 stats_context=stats_context,
                 on_turn_end=on_turn_end,
+                **({"tool_binder": tool_binder} if tool_binder is not None else {}),
             )
         except (ValueError, DatusException) as e:
             error_code = e.code.name if isinstance(e, DatusException) else ErrorCode.COMMON_VALIDATION_FAILED.name
@@ -373,7 +369,9 @@ class ChatService:
 
     def session_exists(self, session_id: str, user_id: Optional[str] = None) -> bool:
         """Check if a session exists on disk."""
-        session_mgr = SessionManager(session_dir=self._session_dir, scope=user_id)
+        session_mgr = SessionManager(
+            session_dir=self._session_dir, scope=session_user_scope(self.agent_config, user_id)
+        )
         return session_mgr.session_exists(session_id)
 
     def list_sessions(
@@ -430,7 +428,9 @@ class ChatService:
             # since a negative offset would silently slice from the tail.
             offset = max(offset, 0)
 
-            session_mgr = SessionManager(session_dir=self._session_dir, scope=user_id)
+            session_mgr = SessionManager(
+                session_dir=self._session_dir, scope=session_user_scope(self.agent_config, user_id)
+            )
             all_ids = session_mgr.list_sessions(sort_by_modified=True)
             if subagent_id is not None:
                 all_ids = [sid for sid in all_ids if session_matches_agent(sid, subagent_id)]
@@ -477,7 +477,9 @@ class ChatService:
     def delete_session(self, session_id: str, user_id: Optional[str] = None) -> Result[ChatSessionData]:
         """Delete a session from disk."""
         try:
-            session_mgr = SessionManager(session_dir=self._session_dir, scope=user_id)
+            session_mgr = SessionManager(
+                session_dir=self._session_dir, scope=session_user_scope(self.agent_config, user_id)
+            )
             if session_mgr.session_exists(session_id):
                 session_mgr.delete_session(session_id)
 
@@ -546,9 +548,11 @@ class ChatService:
         """Get chat history messages for a session."""
         try:
             # Use SessionManager to get messages from SQLite
-            session_manager = SessionManager(session_dir=self._session_dir, scope=user_id)
+            session_manager = SessionManager(
+                session_dir=self._session_dir, scope=session_user_scope(self.agent_config, user_id)
+            )
             bounds = {"min_id": window[0], "max_id": window[1]} if window else {}
-            raw_messages = session_manager.get_session_messages(session_id, **bounds)
+            raw_messages = session_manager.get_session_messages(session_id, include_archive=True, **bounds)
             tool_results = session_manager.get_tool_result_contents(session_id, **bounds)
             tool_calls = session_manager.get_tool_call_contents(session_id, **bounds)
             node_responses = session_manager.get_node_response_contents(session_id, **bounds)
@@ -565,20 +569,30 @@ class ChatService:
                 os.path.join(session_manager.session_dir, session_id) if _is_safe_session_id(session_id) else None
             )
             subagent_runs: Dict[str, List[List[ActionHistory]]] = {}
-            if window and subagent_dir:
+            child_sessions: dict[int, str] = {}
+            if subagent_dir:
+                archive_dir = Path(session_manager.session_dir).resolve() / session_id / "data"
+                task_results = (
+                    action for msg in raw_messages for action in msg.get("actions", []) if _is_task_result(action)
+                )
+                for action in task_results:
+                    child_id = action._indexed_child_session_id or task_child_session_id(
+                        action.output, archive_dir=archive_dir
+                    )
+                    if child_id == TASK_CHILD_UNAVAILABLE:
+                        # Its run could belong to any of the child sessions seen later.
+                        break
+                    if child_id:
+                        # Providers can reuse a call ID in another turn.
+                        child_sessions[id(action)] = child_id
+            if window and child_sessions and subagent_dir:
                 from datus.api.services.history_pagination import subagent_run_offsets
 
-                run_counts = Counter(
-                    child_id
-                    for msg in raw_messages
-                    for action in msg.get("actions", [])
-                    if _is_task_result(action)
-                    and (child_id := _subagent_session_id(action))
-                    and _is_safe_session_id(child_id)
-                )
-                if run_counts:
-                    offsets = subagent_run_offsets(session_manager, session_id, window[0])
-                    for child_id, count in run_counts.items():
+                offsets = subagent_run_offsets(session_manager, session_id, window[0])
+                if offsets is None:
+                    child_sessions.clear()
+                else:
+                    for child_id, count in Counter(child_sessions.values()).items():
                         subagent_runs[child_id] = _load_subagent_runs(
                             subagent_dir, child_id, skip=offsets.get(child_id, 0), count=count
                         )
@@ -650,7 +664,7 @@ class ChatService:
                                     lambda call_id, result_action: _subagent_run_actions(
                                         subagent_dir,
                                         call_id,
-                                        result_action,
+                                        child_sessions.get(id(result_action)),
                                         subagent_runs,
                                         self.agent_config,
                                         node_responses,
@@ -706,6 +720,9 @@ class ChatService:
                 success=True, data=ChatHistoryData(messages=sse_messages, execution_context=context)
             )
 
+        except HistoryArchiveReadError as exc:
+            logger.warning("Failed to read chat history archive: %s", exc.__cause__ or exc)
+            raise
         except Exception as e:
             logger.error(f"Failed to get history for session {session_id}: {e}")
             return Result[ChatHistoryData](

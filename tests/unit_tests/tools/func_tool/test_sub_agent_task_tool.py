@@ -418,15 +418,13 @@ class TestInheritPendingInputQueue:
 class TestResolveNodeType:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("type_field", ["node_class", "type"])
-    async def test_old_report_task_returns_migration_error(self, task_tool, mock_agent_config, type_field):
-        mock_agent_config.agentic_nodes["legacy_report"] = {type_field: "gen_report"}
+    async def test_task_rejects_unknown_configured_type(self, task_tool, mock_agent_config, type_field):
+        mock_agent_config.agentic_nodes["custom_agent"] = {type_field: "unknown_type"}
 
-        result = await task_tool.task(type="legacy_report", prompt="Create a sales report", description="Sales")
+        result = await task_tool.task(type="custom_agent", prompt="Analyze sales", description="Sales")
 
         assert result.success == 0
-        assert "legacy_report" in result.error
-        assert "Subagent 'gen_report' does not exist" in result.error
-        assert "Use 'gen_visual_report' instead" in result.error
+        assert "Unknown subagent type 'unknown_type' configured for 'custom_agent'" in result.error
 
     def test_gen_sql_with_config(self, task_tool):
         """gen_sql resolves to TYPE_GEN_SQL using config key."""
@@ -730,9 +728,9 @@ class TestBuildTaskDescription:
 
     def test_description_defers_routing_to_parent(self, task_tool):
         desc = task_tool._build_task_description()
-        assert "Follow your own system prompt" in desc
-        assert "Chat routing priority" not in desc
-        assert "Task complexity is not the deciding factor" not in desc
+        assert "Follow your own system prompt's delegation principles" in desc
+        assert "Match a bounded task to the current capability descriptions" in desc
+        assert "existing name resolves to a plugin implementation" in desc
 
     @pytest.mark.parametrize("allowed", [["explore"], ["sales_analyst"]])
     def test_restricted_description_does_not_advertise_unavailable_agents(self, mock_agent_config, allowed):
@@ -3363,9 +3361,9 @@ class TestSubagentInheritsParentDatabase:
 
 @pytest.mark.asyncio
 async def test_task_delegation_reviews_plans_through_the_parent_session(task_tool, tmp_path):
-    from datus.tools.func_tool.semantic_plan_file_tools import SemanticPlanFileTools
     from datus.tools.proxy.semantic_plan_review import apply_semantic_plan_review
     from datus.tools.proxy.tool_result_channel import ToolResultChannel
+    from tests.unit_tests.semantic_plan_support import plan_writer
 
     class ReadyChannel(ToolResultChannel):
         async def wait_for(self, call_id, timeout=None):
@@ -3385,7 +3383,7 @@ async def test_task_delegation_reviews_plans_through_the_parent_session(task_too
     )
     apply_semantic_plan_review(parent)
     task_tool.set_parent_node(parent)
-    writer = SemanticPlanFileTools(tmp_path)
+    writer = plan_writer(tmp_path)
     child = MagicMock()
     child.semantic_plan_file_tool = writer
     child.tools = writer.available_tools()

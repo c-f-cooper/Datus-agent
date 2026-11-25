@@ -73,6 +73,7 @@ def routed_environment(environment):
     try:
         yield tool, root
     finally:
+        tool.close()
         manager.close()
 
 
@@ -511,6 +512,26 @@ def test_project_file_descriptors_are_closed_after_success_and_failure(tmp_path,
     for descriptor in handles:
         with pytest.raises(OSError):
             os.fstat(descriptor)
+
+
+def test_scoped_sql_reuses_the_authorized_file_after_a_symlink_change(tmp_path):
+    from datus.utils.sql_utils import read_workspace_sql_file
+
+    allowed = tmp_path / "allowed.sql"
+    hidden = tmp_path / "hidden.sql"
+    alias = tmp_path / "alias.sql"
+    allowed.write_text("SELECT 1")
+    hidden.write_text("SELECT 2")
+    alias.symlink_to(allowed)
+
+    def authorize(path):
+        if path != allowed.resolve():
+            return False
+        alias.unlink()
+        alias.symlink_to(hidden)
+        return True
+
+    assert read_workspace_sql_file(alias.name, str(tmp_path), path_allowed=authorize) == "SELECT 1"
 
 
 @pytest.mark.parametrize("phase", ["directory", "file"])

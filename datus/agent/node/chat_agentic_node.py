@@ -12,7 +12,9 @@ skills, and permissions. This node is fully independent from GenSQLAgenticNode.
 
 import hashlib
 import json
-from typing import ClassVar, Dict, Literal, Optional
+from typing import ClassVar, Dict, Literal, Optional, Sequence
+
+from agents import FunctionTool
 
 from datus.agent.node.agentic_node import AgenticNode
 from datus.agent.node.gen_sql_agentic_node import prepare_template_context
@@ -57,7 +59,29 @@ class ChatAgenticNode(AgenticNode):
         "get_dataset",
         "query_metrics",
         "get_query_metrics_result",
-        "attribution_analyze",
+        "attribute_metrics",
+        "attribute_dimensions",
+    )
+
+    # Reserve these families even when a node's current configuration, model,
+    # or datasource leaves their tools unmounted.
+    _BUILTIN_TOOL_FAMILIES = frozenset(
+        {
+            "bash_tools",
+            "context_search_tools",
+            "date_parsing_tools",
+            "db_tools",
+            "filesystem_tools",
+            "lineage_tools",
+            "memory_tools",
+            "platform_doc_tools",
+            "reference_template_tools",
+            "semantic_tools",
+            "skills",
+            "sub_agent_tools",
+            "tools",
+            "web_tool",
+        }
     )
 
     # Subclasses whose contract is read-only (e.g. artifact ask agents) set this
@@ -103,6 +127,7 @@ class ChatAgenticNode(AgenticNode):
                 self.max_turns = agentic_node_config.get("max_turns", 200)
 
         # Initialize tool attributes BEFORE calling parent constructor
+        self._host_tools = ()
         self.db_func_tool: Optional[DBFuncTool] = None
         self.context_search_tools: Optional[ContextSearchTools] = None
         self.semantic_tools: Optional[SemanticTools] = None
@@ -418,6 +443,17 @@ class ChatAgenticNode(AgenticNode):
             return
         super()._ensure_bash_tool_in_tools()
 
+    def _get_available_skills_context(self) -> str:
+        """Advertise loadable skills only when their tool family is enabled.
+
+        The base constructor can create a SkillFuncTool from a ``skills``
+        pattern even when Chat's explicit ``tools`` allowlist excludes it.
+        Keep the prompt aligned with the surface actually offered to the SDK.
+        """
+        if not self._family_enabled(self._selected_tool_families(), "skills"):
+            return ""
+        return super()._get_available_skills_context()
+
     def _ensure_skill_tools_in_tools(self) -> None:
         if not self._family_enabled(self._selected_tool_families(), "skills"):
             return
@@ -442,6 +478,28 @@ class ChatAgenticNode(AgenticNode):
             self._web_tool = None
             return
         super()._ensure_web_tools_in_tools()
+
+    def install_host_tools(self, tools: Sequence[FunctionTool]) -> None:
+        """Attach tools from the current trusted API host to this node only."""
+        from datus.tools.registry.capabilities import TOOL_CAPABILITIES
+        from datus.tools.registry.contracts import tool_definition
+
+        names = {
+            name
+            for family, name in (tool_id.split(".", 1) for tool_id in TOOL_CAPABILITIES)
+            if family in self._BUILTIN_TOOL_FAMILIES
+        }
+        names.update(tool.name for tool in self.tools)
+        for tool in tools:
+            tool_definition(tool)
+            if tool.name in names:
+                raise ValueError(f"Duplicate host tool: {tool.name}")
+            names.add(tool.name)
+        for tool in tools:
+            self.tool_registry.register_tools(tool_definition(tool).category, [tool])
+        self._host_tools += tuple(tools)
+        self.tools.extend(tools)
+        self._tool_transformers_applied = False
 
     def _rebuild_tools(self):
         """Rebuild the tools list with current tool instances including skills.
@@ -504,6 +562,7 @@ class ChatAgenticNode(AgenticNode):
             self.tools.extend(self._platform_doc_tool.available_tools())
         # Plan-mode tools (confirm_plan + todo_*) for main agents; no-op for sub-agents.
         self._register_plan_mode_tools()
+        self.tools.extend(self._host_tools)
         # The rebuilt list holds fresh, unwrapped FunctionTool instances —
         # force plugin tool transformers to re-apply on the next hook
         # composition or the policy wrappers silently vanish mid-session
@@ -591,6 +650,17 @@ class ChatAgenticNode(AgenticNode):
             return any(tool.name in exposed_names for tool in tool_instance.available_tools())
         except Exception:
             return False
+
+    async def _before_stream(self, ctx: StreamRunContext) -> None:
+        await super()._before_stream(ctx)
+        task_tools = [tool for tool in self.tools if getattr(tool, "name", None) == "task"]
+        if self.sub_agent_task_tool is not None and task_tools:
+            # Refresh metadata in place so permission, plugin and proxy wrappers
+            # keep their existing invocation contract. Tool schemas are sent anew
+            # on each model request; the generic system prompt stays cacheable.
+            description = self.sub_agent_task_tool._build_task_description()
+            for tool in task_tools:
+                tool.description = description
 
     def _system_prompt_snapshot_meta(self, prompt_version: Optional[str]) -> Dict[str, str]:
         context_tools = getattr(self, "context_search_tools", None)

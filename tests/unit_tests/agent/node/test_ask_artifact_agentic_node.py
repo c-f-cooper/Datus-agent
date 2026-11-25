@@ -1906,7 +1906,7 @@ def _fs_tool_names(node) -> set:
 _NO_DB_WHITELIST = (
     "context_search_tools.list_subject_tree,"
     "context_search_tools.search_metrics,date_parsing_tools.*,"
-    "semantic_tools.attribution_analyze,semantic_tools.get_metric,"
+    "semantic_tools.attribute_dimensions,semantic_tools.get_metric,"
     "semantic_tools.list_metrics,semantic_tools.query_metrics"
 )
 
@@ -1968,7 +1968,7 @@ class TestToolsWhitelist:
         """Whitelisted tools the runtime actually builds are present — including
         semantic tools the chat base never builds (proving on-demand build).
 
-        ``attribution_analyze`` and the context_search tools are gated on
+        ``attribute_dimensions`` and the context_search tools are gated on
         optional adapters / subject-KB content absent from the CI fixture, so
         we assert on the adapter-independent semantic wrappers + date parsing,
         all of which are reliably built here.
@@ -2408,3 +2408,12 @@ async def test_empty_artifact_readers_keep_only_the_session_channel(real_agent_c
         node._compose_hooks()
         assert captured_tools is node.tools
         assert [tool.name for tool in captured_tools] == ["ask_user"]
+
+
+@pytest.mark.parametrize("node_class", [AskReportAgenticNode, AskDashboardAgenticNode])
+async def test_unresolved_artifact_scope_blocks_only_companion_initialization(node_class):
+    from types import SimpleNamespace
+
+    config = SimpleNamespace(agentic_nodes={"broken": {"artifact_datasource_error": "DATASOURCE_UNAVAILABLE"}})
+    with pytest.raises(ValueError, match="DATASOURCE_UNAVAILABLE"):
+        node_class(node_id="test", description="test", node_type="test", node_name="broken", agent_config=config)

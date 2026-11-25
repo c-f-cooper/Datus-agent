@@ -10,6 +10,7 @@ import ipaddress
 import json
 import os
 import re
+import threading
 from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ from datus.tools.db_tools.capabilities import (
     get_effective_capabilities,
     supports_namespace,
 )
+from datus.tools.db_tools.connection_scope import borrow_connector, connection_scope, drain_connections
 from datus.tools.db_tools.data_file_loader import (
     LOCAL_FILES_DATASOURCE,
     DataFileError,
@@ -200,7 +202,7 @@ class DBFuncTool(BulkQueryTools):
             sub_agent_name: Optional sub-agent name for scoped context
             scoped_tables: Optional explicit table scope patterns. Cannot be combined with
                            ``scoped_context.tables_by_datasource``; conflicting scopes are rejected.
-            connector_cache_size: Max connectors to cache (LRU eviction), default 8
+            connector_cache_size: Max lookup entries (LRU), default 8; DBManager owns connection limits
             filesystem_root: Root that ``load_file_as_table`` resolves relative paths
                        against. Pass the node's own workspace root: a node configured
                        with ``node_config["workspace_root"]`` anchors its filesystem
@@ -251,6 +253,8 @@ class DBFuncTool(BulkQueryTools):
                 raise ValueError("agent_config is required when connector_or_manager is not provided")
             connector_or_manager = db_manager_instance(agent_config.datasource_configs)
 
+        self._connection_lock = threading.RLock()
+        self._borrowed_connections = {}
         self._connector_datasources: Dict[int, str] = {}
 
         # Determine mode based on input type
@@ -549,6 +553,17 @@ class DBFuncTool(BulkQueryTools):
             result["sample_rows"] = sample_rows
         return result
 
+    def close(self):
+        """Return tool-owned borrows without closing a shared DBManager."""
+        drain_connections(self)
+        with getattr(self, "_connection_lock", threading.RLock()):
+            leases = list(getattr(self, "_borrowed_connections", {}).values())
+            self.__dict__.setdefault("_borrowed_connections", {}).clear()
+            getattr(self, "_connector_cache", {}).clear()
+            self._primary_connector = None
+        for lease in leases:
+            lease.release()
+
     def _init_single_db_connector(self, connector: BaseSqlConnector):
         # Legacy single connector mode
         self._db_manager = None
@@ -568,6 +583,7 @@ class DBFuncTool(BulkQueryTools):
         """Get the primary/default connector (for backward compatibility)."""
         return self._primary_connector
 
+    @connection_scope
     def get_sql_generation_context(self, datasource: Optional[str] = None, database: str = "") -> Dict[str, Any]:
         """Resolve non-secret SQL hints from the same connector used by DB tools."""
         # A reminder naming the bound datasource is not a per-tool override:
@@ -583,6 +599,7 @@ class DBFuncTool(BulkQueryTools):
         context["database"] = database or self._active_database_of(connector)
         return context
 
+    @connection_scope
     def quote_sql_identifier(
         self,
         name: str,
@@ -601,7 +618,7 @@ class DBFuncTool(BulkQueryTools):
         if self._db_manager is None:
             return self.connector
         self._require_scoped_datasource(coordinates.datasource)
-        connector = self._db_manager.get_conn(coordinates.datasource, coordinates.database, context=coordinates)
+        connector = borrow_connector(self, coordinates.datasource, coordinates.database, context=coordinates)
         return self._track_connector(connector, coordinates.datasource)
 
     def connector_for_datasource_default(self, datasource: Optional[str] = None):
@@ -610,7 +627,7 @@ class DBFuncTool(BulkQueryTools):
             return self.connector
         source = datasource or self._default_datasource
         self._require_scoped_datasource(source)
-        return self._track_connector(self._db_manager.get_conn(source), source)
+        return self._track_connector(borrow_connector(self, source, ""), source)
 
     def execution_context(self, connector, datasource: Optional[str] = "") -> Dict[str, str]:
         from datus.schemas.database_context import DatabaseExecutionContext
@@ -630,11 +647,11 @@ class DBFuncTool(BulkQueryTools):
         if context.get("datasource") == datasource and context.get("database", "") == database:
             from datus.schemas.database_context import DatabaseExecutionContext
 
-            connector = self._db_manager.get_conn(
-                datasource, database, context=DatabaseExecutionContext.from_mapping(context)
+            connector = borrow_connector(
+                self, datasource, database, context=DatabaseExecutionContext.from_mapping(context)
             )
         else:
-            connector = self._db_manager.get_conn(datasource, database)
+            connector = borrow_connector(self, datasource, database)
         return self._track_connector(connector, datasource)
 
     def _require_scoped_datasource(self, datasource: str) -> None:
@@ -707,11 +724,13 @@ class DBFuncTool(BulkQueryTools):
         db = database or (self._default_database if ds == self._default_datasource else "")
         key = (ds, db)
 
-        # Check cache
-        if key in self._connector_cache:
-            # Move to end (most recently used)
-            self._connector_cache.move_to_end(key)
-            return self._connector_cache[key]
+        # Managed lookups must re-borrow: an idle connector may have been evicted
+        # by its owner even though the tool's lookup entry is still present.
+        cache_lock = getattr(self, "_connection_lock", threading.RLock())
+        with cache_lock:
+            if key in self._connector_cache and not callable(getattr(type(self._db_manager), "acquire_conn", None)):
+                self._connector_cache.move_to_end(key)
+                return self._connector_cache[key]
 
         try:
             connector = self._resolve_connector(ds, db)
@@ -730,12 +749,16 @@ class DBFuncTool(BulkQueryTools):
             connector.connect()
 
         # Add to cache with LRU eviction
-        if self._connector_cache_size > 0 and len(self._connector_cache) >= self._connector_cache_size:
-            # Evict least recently used (first item)
-            evicted_name, _ = self._connector_cache.popitem(last=False)
-            logger.debug(f"LRU evicting connector: {evicted_name}")
-
-        self._connector_cache[key] = connector
+        with cache_lock:
+            if (
+                key not in self._connector_cache
+                and self._connector_cache_size > 0
+                and len(self._connector_cache) >= self._connector_cache_size
+            ):
+                evicted_name, _ = self._connector_cache.popitem(last=False)
+                logger.debug(f"LRU evicting connector: {evicted_name}")
+            self._connector_cache[key] = connector
+            self._connector_cache.move_to_end(key)
         return connector
 
     def _reset_database_for_rag(self, datasource: Optional[str] = "") -> str:
@@ -1103,8 +1126,12 @@ class DBFuncTool(BulkQueryTools):
         """
         from datus.utils.sql_utils import read_workspace_sql_file
 
+        workspace_root = self._resolve_workspace_root()
+        path_allowed = getattr(self, "sql_file_allowed", None)
         try:
-            return read_workspace_sql_file(file_path, self._resolve_workspace_root())
+            if path_allowed is not None:
+                return read_workspace_sql_file(file_path, workspace_root, path_allowed=path_allowed)
+            return read_workspace_sql_file(file_path, workspace_root)
         except FileNotFoundError:
             raise DatusException(
                 ErrorCode.COMMON_FILE_NOT_FOUND,
@@ -1300,12 +1327,12 @@ class DBFuncTool(BulkQueryTools):
         patterns = self._patterns_for_connector(routed_connector)
         if not patterns:
             return []
-        from datus.utils.sql_utils import extract_table_names
+        from datus.utils.sql_utils import extract_table_names_for_scope
 
         dialect = getattr(routed_connector, "dialect", "") or ""
-        table_names = extract_table_names(sql, dialect=dialect, ignore_empty=True)
+        table_names = extract_table_names_for_scope(sql, dialect=dialect)
         if not table_names:
-            return []  # can't parse → allow (SHOW/DESCRIBE/EXPLAIN have no tables)
+            return []  # Table-free statements such as SHOW have no table scope to check.
         out_of_scope: List[str] = []
         analyzer_getter = getattr(connector_registry, "get_sql_analyzer", None)
         native_analysis = callable(analyzer_getter) and analyzer_getter(dialect) is not None
@@ -1337,7 +1364,9 @@ class DBFuncTool(BulkQueryTools):
     # agent-facing tool surface. ``to_function_tool`` converts a bound method into
     # a Tool; ``available_tools`` assembles the runtime list. Neither is a tool
     # itself. Mirrors ``FilesystemFuncTool._BASE_TOOL_FRAMEWORK_METHODS``.
-    _FRAMEWORK_METHODS: frozenset = frozenset({"available_tools", "to_function_tool", "get_sql_generation_context"})
+    _FRAMEWORK_METHODS: frozenset = frozenset(
+        {"available_tools", "to_function_tool", "get_sql_generation_context", "close"}
+    )
 
     # Internal statement-dispatch targets of the unified ``execute_sql`` entry
     # point. ``execute_sql`` detects the statement type and routes to these by
@@ -1543,6 +1572,7 @@ class DBFuncTool(BulkQueryTools):
         return identity
 
     @tool_contract(access="read", direct_call=True)
+    @connection_scope
     def get_datasource_identity(self, datasource: str = "") -> FuncToolResult:
         """Inspect public coordinates of the effective runtime connection used by child tasks.
 
@@ -1615,6 +1645,7 @@ class DBFuncTool(BulkQueryTools):
             }
         )
 
+    @connection_scope
     @mcp_tool(availability_check="has_schema")
     @tool_contract(access="read", direct_call=True)
     def search_table(
@@ -1760,6 +1791,7 @@ class DBFuncTool(BulkQueryTools):
         page = list_page(rows, snapshot_id, size, offset)
         return FuncToolResult(result=deepcopy(page))
 
+    @connection_scope
     @mcp_tool()
     @tool_contract(access="read", direct_call=True)
     @native_pagination()
@@ -1833,6 +1865,7 @@ class DBFuncTool(BulkQueryTools):
         except Exception as e:
             return FuncToolResult(success=0, error=str(e))
 
+    @connection_scope
     @mcp_tool()
     @tool_contract(access="read", direct_call=True)
     @native_pagination()
@@ -1891,6 +1924,7 @@ class DBFuncTool(BulkQueryTools):
         except Exception as e:
             return FuncToolResult(success=0, error=str(e))
 
+    @connection_scope
     @mcp_tool()
     @tool_contract(access="read", direct_call=True)
     @native_pagination()
@@ -1983,6 +2017,7 @@ class DBFuncTool(BulkQueryTools):
         except Exception as e:
             return FuncToolResult(success=0, error=str(e))
 
+    @connection_scope
     @mcp_tool()
     @tool_contract(access="read", direct_call=True)
     def describe_table(
@@ -2300,6 +2335,7 @@ class DBFuncTool(BulkQueryTools):
             )
         return resolved
 
+    @connection_scope
     @mcp_tool()
     @tool_contract(access="restricted", direct_call=True)
     def load_file_as_table(
@@ -2527,6 +2563,7 @@ class DBFuncTool(BulkQueryTools):
             )
         return exclusive, None
 
+    @connection_scope
     @mcp_tool()
     @tool_contract(access="read", direct_call=True)
     def plan_datasource(
@@ -2629,6 +2666,7 @@ class DBFuncTool(BulkQueryTools):
             logger.error(f"plan_datasource failed: {e}", exc_info=True)
             return FuncToolResult(success=0, error=f"Failed to plan the datasource: {e}")
 
+    @connection_scope
     @mcp_tool()
     @tool_contract(access="write", direct_call=True)
     def import_database_file(
@@ -2805,6 +2843,7 @@ class DBFuncTool(BulkQueryTools):
             return None
         return {"removed": removed, "added": added, "kept": len(names) - len(added)}
 
+    @connection_scope
     @mcp_tool()
     @tool_contract(access="restricted", direct_call=True)
     def check_datasource_quality(
@@ -2967,6 +3006,7 @@ class DBFuncTool(BulkQueryTools):
             logger.error(f"check_datasource_quality failed: {e}", exc_info=True)
             return FuncToolResult(success=0, error=f"Quality check failed: {e}")
 
+    @connection_scope
     @mcp_tool()
     @tool_contract(access="sql", direct_call=True)
     def execute_sql(
@@ -3102,6 +3142,7 @@ class DBFuncTool(BulkQueryTools):
         except Exception as e:
             return FuncToolResult(success=0, error=str(e))
 
+    @connection_scope
     def read_query(
         self, sql: str, datasource: Optional[str] = "", database: Optional[str] = "", *, compress: bool = True
     ) -> FuncToolResult:
@@ -3183,7 +3224,7 @@ class DBFuncTool(BulkQueryTools):
         LLM ``read_query`` path plus the report/dashboard artifact save paths
         and dashboard view-time re-execution. Rejects multi-statement input and
         applies configured policy runtimes (rewrites / denials) before
-        the statement reaches the engine, then returns the connector's raw
+        the statement reaches the engine, then returns the
         ``ExecuteSQLResult`` after result policies have run. Without this,
         artifact query execution bypassed policy enforcement
         and could hand the engine an unbounded statement (e.g. a cross-join
@@ -3306,6 +3347,12 @@ class DBFuncTool(BulkQueryTools):
                     error="Read policy transformed the reference result; complete calculation verification is unavailable.",
                     sql_query=enforced_sql,
                 )
+            if result_decision.result is not result.sql_return:
+                column_names = getattr(result_decision, "column_names", None) if result_format == "list" else None
+                if column_names is not None and not hasattr(result, "column_names"):
+                    result = ExecuteSQLResult.model_validate(result, from_attributes=True)
+                if hasattr(result, "column_names"):
+                    result.column_names = column_names
             result.sql_return = result_decision.result
             if typed_policy_result and result_format in {"csv", "pandas"}:
                 import pandas as pd
@@ -3484,6 +3531,7 @@ class DBFuncTool(BulkQueryTools):
         return None, sql_type
 
     @tool_contract(access="read", direct_call=False)
+    @connection_scope
     def get_table_ddl(
         self,
         table_name: str,
@@ -3550,6 +3598,7 @@ class DBFuncTool(BulkQueryTools):
 
     # Regex matching allowed DDL statement prefixes
     @tool_contract(access="write", direct_call=False)
+    @connection_scope
     def execute_ddl(self, sql: str, datasource: Optional[str] = "", database: Optional[str] = "") -> FuncToolResult:
         """
         Execute a single non-read, non-DML SQL statement (the generic write path).
@@ -3657,6 +3706,7 @@ class DBFuncTool(BulkQueryTools):
         except Exception as e:
             return FuncToolResult(success=0, error=f"DDL execution failed: {str(e)}")
 
+    @connection_scope
     def execute_write(
         self,
         sql: str,
@@ -3978,6 +4028,7 @@ class DBFuncTool(BulkQueryTools):
         return FuncToolResult(result={"sql": create_sql})
 
     @tool_contract(access="write", direct_call=False)
+    @connection_scope
     def transfer_query_result(
         self,
         source_sql: str,
@@ -4384,6 +4435,7 @@ class DBFuncTool(BulkQueryTools):
     # these methods, we return safe fallback values so the migration agent
     # can continue in pure-LLM mode.
 
+    @connection_scope
     @mcp_tool()
     @tool_contract(access="read", direct_call=True)
     def get_migration_capabilities(self, datasource: Optional[str] = "") -> FuncToolResult:
@@ -4430,6 +4482,7 @@ class DBFuncTool(BulkQueryTools):
             )
         return FuncToolResult(result=capabilities)
 
+    @connection_scope
     @mcp_tool()
     @tool_contract(access="read", direct_call=True)
     def suggest_table_layout(self, datasource: Optional[str] = "", columns_json: str = "[]") -> FuncToolResult:
@@ -4471,6 +4524,7 @@ class DBFuncTool(BulkQueryTools):
             return FuncToolResult(result={})
         return FuncToolResult(result=suggestion)
 
+    @connection_scope
     @mcp_tool()
     @tool_contract(access="write", direct_call=True)
     def validate_ddl(

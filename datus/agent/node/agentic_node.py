@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import uuid
@@ -47,7 +48,9 @@ from datus.observability.compaction import compact_metrics, compact_started, obs
 from datus.prompts.prompt_manager import get_prompt_manager
 from datus.schemas.action_history import ActionHistory, ActionHistoryManager, ActionRole, ActionStatus
 from datus.schemas.base import BaseInput, BaseResult
+from datus.tools.db_tools.async_workers import DATABASE_CLEANUP
 from datus.tools.db_tools.data_file_loader import LOCAL_FILES_DATASOURCE
+from datus.utils.artifact_output import session_user_scope
 from datus.utils.exceptions import DatusException, ErrorCode
 from datus.utils.language_utils import build_fallback_directive as _build_fallback_directive
 from datus.utils.language_utils import ensure_native_directive as _ensure_native_directive
@@ -67,6 +70,9 @@ if TYPE_CHECKING:
     from datus.tools.skill_tools.skill_manager import SkillManager
 
 logger = get_logger(__name__)
+
+# Bound waiting for datasource leases; their release worker never writes sessions.
+_DATABASE_CLOSE_TIMEOUT = 5.0
 
 
 class AgenticNode(Node):
@@ -400,7 +406,7 @@ class AgenticNode(Node):
                 from datus.utils.path_manager import get_path_manager
 
                 base_dir = str(get_path_manager(agent_config=cfg).sessions_dir)
-            user_scope = getattr(self, "scope", None)
+            user_scope = session_user_scope(cfg, getattr(self, "scope", None))
             session_subdir = getattr(self, "session_subdir", None)
 
             if session_subdir:
@@ -410,6 +416,40 @@ class AgenticNode(Node):
             else:
                 self._session_manager = SessionManager(session_dir=base_dir, scope=user_scope)
         return self._session_manager
+
+    async def aclose(self) -> None:
+        """Release resources owned by this finished node, leaving shared models alone."""
+        db_tool = getattr(self, "db_func_tool", None)
+        if db_tool is not None:
+            job = getattr(self, "_database_close_job", None)
+            if job is None:
+                job = DATABASE_CLEANUP.submit(db_tool.close)
+                self._database_close_job = job
+            await AgenticNode._wait_for_database_release(job)
+        session = getattr(self, "_session", None)
+        close = getattr(session, "close", None)
+        if callable(close):
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.exception("Failed to close node session")
+        self._session = None
+        manager = getattr(self, "_session_manager", None)
+        if manager is not None:
+            manager.close_all_sessions()
+        self._session_manager = None
+
+    @staticmethod
+    async def _wait_for_database_release(job) -> None:
+        try:
+            await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(job)), timeout=_DATABASE_CLOSE_TIMEOUT)
+        except asyncio.TimeoutError:
+            # The worker keeps its leases until the driver returns.
+            logger.warning("Node database tool release timed out after %.1fs", _DATABASE_CLOSE_TIMEOUT)
+        except Exception:
+            logger.exception("Failed to release node database tool")
 
     def relocate_session(self, *, scope: Optional[str], session_subdir: Optional[str]) -> None:
         """Point this node's session at another directory after construction.
@@ -1216,9 +1256,11 @@ class AgenticNode(Node):
             return node_class
         return AgenticNode.get_node_name(self)
 
-    def _response_provenance(self, user_input: Any) -> Dict[str, str]:
-        """Identify this producer and any versioned chat result protocol."""
-        source = {"_node_class": self.get_node_class_name()}
+    def _response_provenance(self, user_input: Any) -> Dict[str, str | bool]:
+        """Identify the response producer and its display protocol."""
+        source: Dict[str, str | bool] = {"_node_class": self.get_node_class_name()}
+        if getattr(self, "defer_model_output", False) is True:
+            source["_defer_model_output"] = True
         if source["_node_class"] == "chat":
             config = getattr(self, "node_config", None) or {}
             version = (
@@ -2361,17 +2403,24 @@ class AgenticNode(Node):
         )
 
     async def _replace_session_items(
-        self, items: List[Dict[str, Any]], *, mode: str = "minor", pending_user_turns: int = 0
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        mode: str = "minor",
+        pending_user_turns: int = 0,
+        history_pending: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Atomically replace history and complete rewrite bookkeeping before cancellation."""
         if self._session is None:
             raise DatusException(ErrorCode.COMMON_FIELD_REQUIRED, message_args={"field_name": "session"})
 
         async def replace() -> None:
+            options: Dict[str, Any] = {}
             if pending_user_turns:
-                await self._session.replace_items(items, pending_user_turns=pending_user_turns)
-            else:
-                await self._session.replace_items(items)
+                options["pending_user_turns"] = pending_user_turns
+            if history_pending:
+                options["history_pending"] = history_pending
+            await self._session.replace_items(items, **options)
             self._invalidate_context_usage()
             self._refresh_turn_checkpoint_after_rewrite()
             if mode == "major":
@@ -2451,6 +2500,7 @@ class AgenticNode(Node):
         first_call: bool = False,
         archive_history: bool = False,
         pending_user_turns: int = 0,
+        history_pending: Optional[List[Dict[str, Any]]] = None,
         output_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Two-stage compaction of the transcript a running turn is about to send.
@@ -2584,7 +2634,12 @@ class AgenticNode(Node):
                     return result
 
                 try:
-                    await self._replace_session_items(view, mode=result["mode"], pending_user_turns=pending_user_turns)
+                    await self._replace_session_items(
+                        view,
+                        mode=result["mode"],
+                        pending_user_turns=pending_user_turns,
+                        history_pending=history_pending,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.error("Failed to persist mid-turn compact rewrite: %s", exc)
                     raise ContextCapacityError("SESSION_PERSIST_FAILED", "Cannot persist the prepared context") from exc
@@ -2735,6 +2790,7 @@ class AgenticNode(Node):
             "rules",
             "max_turns",
             "workspace_root",
+            "db_read_only",
             "scoped_context",
             "scoped_kb_path",
             "adapter_type",
@@ -3030,6 +3086,10 @@ class AgenticNode(Node):
         del skill_name
         return content
 
+    def _required_skill_agent(self, skill_name: str) -> str:
+        """Resolve the authoring role used to load a host-required specification."""
+        return self.get_node_name()
+
     def _required_skill_context(self) -> str:
         """Resolve the exact skill context used for injection and snapshot identity.
 
@@ -3077,7 +3137,7 @@ class AgenticNode(Node):
         for skill_name in skills_to_inject:
             success, message, content = self.skill_manager.load_skill(
                 skill_name,
-                self.get_node_name(),
+                self._required_skill_agent(skill_name),
                 check_permission=False,
                 node_class=self.get_node_class_name(),
             )

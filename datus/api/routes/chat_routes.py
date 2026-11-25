@@ -49,7 +49,10 @@ from datus.api.models.cli_models import (
     UserInteractionInput,
 )
 from datus.api.services.background_drain import track_background_task
+from datus.api.services.chat_extensions import ChatToolProvider
+from datus.api.utils.service_stream import ServiceStreamingResponse
 from datus.api.utils.stream_errors import humanize_stream_error
+from datus.models.history_archive import HistoryArchiveReadError
 from datus.tools.policy_runtime import PolicyRuntime
 from datus.utils.exceptions import DatusException
 from datus.utils.feedback_prompt import build_reaction_feedback_prompt
@@ -153,6 +156,10 @@ async def stream_chat(
             headers=_sse_headers(),
         )
 
+    provider: ChatToolProvider | None = getattr(http_request.app.state, "chat_tool_provider", None)
+    tool_binder = await provider(http_request, ctx, request) if provider is not None else None
+    tool_options = {"tool_binder": tool_binder} if tool_binder is not None else {}
+
     pre_extra = pre_outcome.extra if pre_outcome else {}
     stats_context = _capture_turn_stats_context(http_request, request, ctx.user_id)
 
@@ -167,13 +174,14 @@ async def stream_chat(
                 policy_context=ctx.policy_context,
                 stats_context=stats_context,
                 on_turn_end=on_turn_end,
+                **tool_options,
             ),
             request=request,
             user_id=ctx.user_id,
         ):
             yield chunk
 
-    return StreamingResponse(generate_sse(), media_type="text/event-stream", headers=_sse_headers())
+    return ServiceStreamingResponse(generate_sse(), service=svc, media_type="text/event-stream", headers=_sse_headers())
 
 
 # ========== Reaction-triggered Feedback ==========
@@ -227,7 +235,7 @@ async def stream_chat_feedback(
         ):
             yield f"id: {event.id}\nevent: {event.event}\ndata: {event.data.model_dump_json()}\n\n"
 
-    return StreamingResponse(generate_sse(), media_type="text/event-stream", headers=_sse_headers())
+    return ServiceStreamingResponse(generate_sse(), service=svc, media_type="text/event-stream", headers=_sse_headers())
 
 
 # ========== Resume Chat ==========
@@ -262,12 +270,11 @@ async def resume_chat(
     async def generate_sse():
         """Serialize buffered events while omitting transient diffs on ordinary session entry."""
         # A resumed stream can begin after the original session frame.
-        if task.node is not None:
+        llm_session_id = task.llm_session_id or (task.node.session_id if task.node is not None else None)
+        if llm_session_id is not None:
             from datus.api.models.cli_models import SSESessionData
 
-            session = SSESessionData(
-                session_id=task.session_id, llm_session_id=task.node.session_id, run_id=task.run_id
-            )
+            session = SSESessionData(session_id=task.session_id, llm_session_id=llm_session_id, run_id=task.run_id)
             yield f"event: session\ndata: {session.model_dump_json()}\n\n"
         async for event in task_manager.consume_events(task, start_from=request.from_event_id):
             if (
@@ -278,7 +285,7 @@ async def resume_chat(
                 continue
             yield f"id: {event.id}\nevent: {event.event}\ndata: {event.data.model_dump_json()}\n\n"
 
-    return StreamingResponse(generate_sse(), media_type="text/event-stream", headers=_sse_headers())
+    return ServiceStreamingResponse(generate_sse(), service=svc, media_type="text/event-stream", headers=_sse_headers())
 
 
 # ========== Stop Chat ==========
@@ -409,6 +416,8 @@ async def get_chat_history(
             asyncio.to_thread(svc.chat.get_history, session_id, user_id=ctx.user_id),
             timeout=_FUSE_IO_TIMEOUT,
         )
+    except HistoryArchiveReadError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except TimeoutError:
         return Result[ChatHistoryData](
             success=False, errorCode="REQUEST_TIMEOUT", errorMessage="History fetch timed out"
@@ -435,6 +444,8 @@ async def get_chat_history_page(
         return Result(success=True, data=data)
     except HistoryChangedError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except HistoryArchiveReadError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except TimeoutError as exc:
@@ -468,6 +479,8 @@ async def get_chat_history_content(
         )
     except HistoryChangedError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except HistoryArchiveReadError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
@@ -488,10 +501,11 @@ async def get_chat_history_content(
 async def submit_user_interaction(
     request: UserInteractionInput,
     svc: ServiceDep,
+    ctx: AppContextDep,
 ) -> Result[dict]:
     task_manager = svc.task_manager
     task = task_manager.get_task(request.session_id)
-    if task is None or task.node is None:
+    if task is None or task.node is None or task.user_id != ctx.user_id:
         return Result[dict](
             success=False,
             errorCode="SESSION_NOT_FOUND",

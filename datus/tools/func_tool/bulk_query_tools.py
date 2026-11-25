@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import pyarrow as pa
 
+from datus.tools.db_tools.connection_scope import connection_scope
 from datus.tools.db_tools.query_spool import (
     ACTIVE_EXPORT_SQL_APPROVAL,
     QueryLimits,
@@ -33,6 +34,9 @@ class BulkQueryTools:
 
     def _bulk_sql(self, value: str, files: ProjectFiles) -> tuple[str, str]:
         if looks_like_sql_file_ref(value.lower()):
+            path_allowed = getattr(self, "sql_file_allowed", None)
+            if path_allowed is not None:
+                return files.read_sql(value.strip(), MAX_SQL_FILE_BYTES, path_allowed=path_allowed)
             return files.read_sql(value.strip(), MAX_SQL_FILE_BYTES)
         return value, "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -196,6 +200,7 @@ class BulkQueryTools:
                 applied.update(result.applied_policies)
                 spool.add(result.result)
 
+    @connection_scope
     @tool_contract(access="write", direct_call=False, category="db_tools")
     def export_query(
         self,

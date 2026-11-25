@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tupl
 
 from agents.lifecycle import AgentHooks
 
-from datus.cli.execution_state import InteractionBroker, InteractionCancelled
+from datus.cli.execution_state import InteractionBroker
 from datus.schemas.interaction_event import InteractionEvent
 from datus.tools.func_tool.fs_path_policy import PathAllowlist, PathZone, classify_path
 from datus.tools.permission import review_registry
@@ -177,10 +177,20 @@ def _format_tool_args_markdown(args: dict) -> str:
 class PermissionDeniedException(Exception):
     """Exception raised when a tool call is denied by permission rules."""
 
-    def __init__(self, message: str, tool_category: str = "", tool_name: str = ""):
+    def __init__(
+        self,
+        message: str,
+        tool_category: str = "",
+        tool_name: str = "",
+        *,
+        user_declined: bool = False,
+        model_message: str | None = None,
+    ):
         super().__init__(message)
         self.tool_category = tool_category
         self.tool_name = tool_name
+        self.user_declined = user_declined
+        self.model_message = message if model_message is None else model_message
 
 
 @dataclass(frozen=True)
@@ -378,6 +388,7 @@ class PermissionHooks(AgentHooks):
         self.non_interactive = non_interactive
         self.proxied_tool_names = proxied_tool_names
         self.project_root = project_root
+        self.sql_file_allowed = None
         self.config_mutable = bool(config_mutable)
         self.bash_classifier = bash_classifier
         self.auto_reviewer = auto_reviewer
@@ -663,8 +674,7 @@ class PermissionHooks(AgentHooks):
                 (
                     f"PERMISSION_DENIED: Tool '{tool_name}' ({category}) is blocked by the "
                     f"'{profile}' permission profile. STOP retrying this tool — different "
-                    "parameters will not change the outcome. Return the failure to your "
-                    "caller and stop. The user can run /profile to open the "
+                    "parameters will not change the outcome. The user can run /profile to open the "
                     "profile picker and choose an appropriate mode with the "
                     "arrow keys, or add a permission rule under "
                     "`permissions.rules` in agent.yml."
@@ -687,9 +697,7 @@ class PermissionHooks(AgentHooks):
                     (
                         f"PERMISSION_DENIED: Tool '{tool_name}' ({category}) requires user "
                         f"confirmation but this flow runs non-interactively under the "
-                        f"'{profile}' profile. The tool is outside that profile's scope. "
-                        f"STOP retrying — different parameters will not change the outcome. "
-                        f"Surface the failure to the caller."
+                        f"'{profile}' profile."
                     ),
                     tool_category=category,
                     tool_name=pattern_name,
@@ -727,6 +735,7 @@ class PermissionHooks(AgentHooks):
                         f"User rejected execution of '{tool_name}'",
                         tool_category=category,
                         tool_name=pattern_name,
+                        user_declined=True,
                     )
 
                 logger.info(f"User approved tool '{tool_name}'")
@@ -738,10 +747,8 @@ class PermissionHooks(AgentHooks):
     # defeats the purpose: the artifact only makes sense as a whole and
     # the user reviews it via the rendered preview, not per-file diffs.
     # Mirror of ``_FS_DEPENDENT_NODES`` in ``datus.tools.proxy.proxy_tool``
-    # (which exempts the same nodes from the IDE proxy round-trip) and the
-    # ``isAutoConfirmFilePath`` carve-out in ``Datus-saas`` (which silences
-    # the per-tool Accept bar in the chat panel). All three layers must
-    # agree or one of them keeps gating the user.
+    # (which exempts the same nodes from the IDE proxy round-trip). Clients
+    # that prompt for tool approval should apply the same exception.
     _ARTIFACT_AUTOALLOW_NODES = frozenset({"gen_visual_report", "gen_visual_dashboard"})
 
     # Relative-to-project-root path prefixes the carve-out applies to.
@@ -904,15 +911,15 @@ class PermissionHooks(AgentHooks):
                 resolved.resolved,
                 profile,
             )
+            explanation = (
+                "is outside the project root and requires user confirmation, "
+                f"but this flow runs non-interactively under the '{profile}' profile."
+            )
             raise PermissionDeniedException(
-                (
-                    f"PERMISSION_DENIED: filesystem path '{resolved.resolved}' is outside the "
-                    f"project root and requires user confirmation, but this flow runs "
-                    f"non-interactively under the '{profile}' profile. STOP retrying — "
-                    f"choose a path inside the project root or surface the failure."
-                ),
+                f"PERMISSION_DENIED: filesystem path '{resolved.resolved}' {explanation}",
                 tool_category=category,
                 tool_name=pattern_name,
+                model_message=f"PERMISSION_DENIED: filesystem path {resolved.raw!r} {explanation}",
             )
 
         # Dangerous profile in interactive mode: opt out of the EXTERNAL ASK
@@ -943,6 +950,8 @@ class PermissionHooks(AgentHooks):
                     f"User rejected external filesystem access to {resolved.resolved}",
                     tool_category=category,
                     tool_name=pattern_name,
+                    user_declined=True,
+                    model_message=f"User rejected external filesystem access to {resolved.raw!r}",
                 )
             logger.info("User approved external filesystem access to %s", resolved.resolved)
             return True
@@ -964,31 +973,25 @@ class PermissionHooks(AgentHooks):
             f"**Tool:** `{category}.{pattern_name}`\n"
             f"**Path:** `{abs_path}`  _(outside project root)_\n"
         )
-        try:
-            answers = await self.broker.request(
-                [
-                    InteractionEvent(
-                        title="Permission",
-                        content=content,
-                        choices={"y": "Allow (once)", "a": "Always allow (this path, session)", "n": "Deny"},
-                        default_choice="n",
-                    )
-                ]
-            )
-            choice = answers[0][0] if answers and answers[0] else ""
+        answers = await self.broker.request(
+            [
+                InteractionEvent(
+                    title="Permission",
+                    content=content,
+                    choices={"y": "Allow (once)", "a": "Always allow (this path, session)", "n": "Deny"},
+                    default_choice="n",
+                )
+            ]
+        )
+        choice = answers[0][0] if answers and answers[0] else ""
 
-            if choice == "a":
-                cache_key = f"external::{abs_path}"
-                self.permission_manager.approve_for_session(category, cache_key)
-                return True
-            if choice == "y":
-                return True
-            return False
-        except InteractionCancelled:
-            return False
-        except Exception as e:
-            logger.error(f"Error in external filesystem confirmation for {tool_name}: {e}")
-            return False
+        if choice == "a":
+            cache_key = f"external::{abs_path}"
+            self.permission_manager.approve_for_session(category, cache_key)
+            return True
+        if choice == "y":
+            return True
+        return False
 
     # Read-only statement kinds that auto-allow under ``execute_sql``
     # regardless of profile (legacy path — the class-rule path resolves the
@@ -1092,6 +1095,8 @@ class PermissionHooks(AgentHooks):
 
                     def read_export_sql(path):
                         with ProjectFiles(Path(root)) as files:
+                            if self.sql_file_allowed is not None:
+                                return files.read_sql(path, MAX_SQL_FILE_BYTES, path_allowed=self.sql_file_allowed)[0]
                             return files.read_sql(path, MAX_SQL_FILE_BYTES)[0]
 
                     sql = await asyncio.to_thread(read_export_sql, sql.strip())
@@ -1101,7 +1106,12 @@ class PermissionHooks(AgentHooks):
                         hashlib.sha256(sql.encode("utf-8")).hexdigest(),
                     )
                 else:
-                    sql = read_workspace_sql_file(sql.strip(), self.project_root or ".")
+                    if self.sql_file_allowed is not None:
+                        sql = read_workspace_sql_file(
+                            sql.strip(), self.project_root or ".", path_allowed=self.sql_file_allowed
+                        )
+                    else:
+                        sql = read_workspace_sql_file(sql.strip(), self.project_root or ".")
             except Exception as e:
                 logger.debug("execute_sql gate: could not resolve .sql file (%s); treating as UNKNOWN", e)
         # No dialect available at the hook layer; the keyword fallback in
@@ -1155,8 +1165,7 @@ class PermissionHooks(AgentHooks):
                 (
                     f"PERMISSION_DENIED: SQL statement kind '{kind}' (class '{sql_class}') is "
                     f"blocked by the '{profile}' permission profile's sql_statements rules. "
-                    f"STOP retrying — rewording the SQL will not change the outcome. Return "
-                    f"the failure to your caller. The user can adjust "
+                    f"Rewording the SQL will not change the outcome. The user can adjust "
                     f"`permissions.sql_statements` in agent.yml."
                 ),
                 tool_category="db_tools",
@@ -1219,8 +1228,7 @@ class PermissionHooks(AgentHooks):
             raise PermissionDeniedException(
                 (
                     f"PERMISSION_DENIED: SQL statement kind '{kind}' requires confirmation under "
-                    f"the '{profile}' profile, but this flow is non-interactive.{review_suffix} "
-                    "STOP retrying — surface the failure to the caller."
+                    f"the '{profile}' profile, but this flow is non-interactive.{review_suffix}"
                 ),
                 tool_category="db_tools",
                 tool_name=tool_name,
@@ -1267,6 +1275,7 @@ class PermissionHooks(AgentHooks):
                 f"User rejected execution of '{tool_name}'",
                 tool_category="db_tools",
                 tool_name=tool_name,
+                user_declined=True,
             )
 
     async def _handle_sql_permission_legacy(self, context: Any, kind: str) -> bool:
@@ -1310,6 +1319,7 @@ class PermissionHooks(AgentHooks):
                     "User rejected execution of 'execute_sql'",
                     tool_category="db_tools",
                     tool_name="execute_sql",
+                    user_declined=True,
                 )
             logger.info("User approved execute_sql (%s)", sql_class)
             return True
@@ -1353,23 +1363,17 @@ class PermissionHooks(AgentHooks):
             choices["p"] = f"Allow '{kind}' (project)"
         choices["n"] = "Deny"
 
-        try:
-            answers = await self.broker.request(
-                [
-                    InteractionEvent(
-                        title="SQL Permission",
-                        content=content,
-                        choices=choices,
-                        default_choice="n",
-                    )
-                ]
-            )
-            return answers[0][0] if answers and answers[0] else ""
-        except InteractionCancelled:
-            return ""
-        except Exception as e:
-            logger.error(f"Error in SQL permission confirmation: {e}")
-            return ""
+        answers = await self.broker.request(
+            [
+                InteractionEvent(
+                    title="SQL Permission",
+                    content=content,
+                    choices=choices,
+                    default_choice="n",
+                )
+            ]
+        )
+        return answers[0][0] if answers and answers[0] else ""
 
     async def _handle_bash_permission(self, context: Any, tool_name: str, pattern_name: str) -> bool:
         """Command-level gating for ``bash_tools.bash`` calls.
@@ -1457,7 +1461,7 @@ class PermissionHooks(AgentHooks):
                     f"PERMISSION_DENIED: Bash command blocked by rule "
                     f"'{decision.matched_pattern}' under the '{profile}' permission "
                     f"profile. STOP retrying this command — rewording it will not "
-                    f"change the outcome. Return the failure to your caller. The "
+                    f"change the outcome. The "
                     f"user can adjust `permissions.bash_commands` in agent.yml."
                 ),
                 tool_category="bash_tools",
@@ -1573,7 +1577,7 @@ class PermissionHooks(AgentHooks):
                 (
                     f"PERMISSION_DENIED: Bash command requires confirmation ({decision.reason}) "
                     f"but this flow runs non-interactively under the '{profile}' profile."
-                    f"{review_suffix} STOP retrying — surface the failure to the caller."
+                    f"{review_suffix}"
                 ),
                 tool_category="bash_tools",
                 tool_name="bash",
@@ -1638,6 +1642,7 @@ class PermissionHooks(AgentHooks):
                 "User rejected execution of bash command",
                 tool_category="bash_tools",
                 tool_name="bash",
+                user_declined=True,
             )
 
     def _approve_segments_for_session(self, segment_keys: Tuple[str, ...]) -> None:
@@ -1752,23 +1757,17 @@ class PermissionHooks(AgentHooks):
             choices["p"] = self._format_scope_label(patterns, "project")
         choices["n"] = "Deny"
 
-        try:
-            answers = await self.broker.request(
-                [
-                    InteractionEvent(
-                        title="Bash Permission",
-                        content=content,
-                        choices=choices,
-                        default_choice="n",
-                    )
-                ]
-            )
-            return answers[0][0] if answers and answers[0] else ""
-        except InteractionCancelled:
-            return ""
-        except Exception as e:
-            logger.error(f"Error in bash permission confirmation: {e}")
-            return ""
+        answers = await self.broker.request(
+            [
+                InteractionEvent(
+                    title="Bash Permission",
+                    content=content,
+                    choices=choices,
+                    default_choice="n",
+                )
+            ]
+        )
+        return answers[0][0] if answers and answers[0] else ""
 
     def _get_category_and_pattern(self, tool_name: str, context: Any) -> Tuple[str, str]:
         """Get tool category and pattern name for permission checking.
@@ -1783,6 +1782,9 @@ class PermissionHooks(AgentHooks):
             MCP:     ("mcp.filesystem", "read_file")
             Skills:  ("skills", "deep-analysis")  # skill_name from args
         """
+        mcp_server_name = getattr(context, "_datus_mcp_server_name", None)
+        if isinstance(mcp_server_name, str) and mcp_server_name:
+            return (f"mcp.{mcp_server_name}", tool_name)
         # 1. Skills: load_skill -> extract skill_name as pattern (check BEFORE registry)
         #    This allows permission rules like "skills.admin-*" to match specific skills
         if tool_name == "load_skill":
@@ -1860,31 +1862,24 @@ class PermissionHooks(AgentHooks):
         if args_md:
             content += args_md + "\n"
 
-        try:
-            answers = await self.broker.request(
-                [
-                    InteractionEvent(
-                        title="Permission",
-                        content=content,
-                        choices={"y": "Allow (once)", "a": "Always allow (session)", "n": "Deny"},
-                        default_choice="n",
-                    )
-                ]
-            )
-            choice = answers[0][0] if answers and answers[0] else ""
+        answers = await self.broker.request(
+            [
+                InteractionEvent(
+                    title="Permission",
+                    content=content,
+                    choices={"y": "Allow (once)", "a": "Always allow (session)", "n": "Deny"},
+                    default_choice="n",
+                )
+            ]
+        )
+        choice = answers[0][0] if answers and answers[0] else ""
 
-            if choice == "a":
-                self.permission_manager.approve_for_session(category, pattern_name)
-                if tool_name and tool_name != pattern_name:
-                    self.permission_manager.approve_for_session(category, tool_name)
-                return True
-            elif choice == "y":
-                return True
-            else:
-                return False
-
-        except InteractionCancelled:
-            return False
-        except Exception as e:
-            logger.error(f"Error in permission confirmation: {e}")
+        if choice == "a":
+            self.permission_manager.approve_for_session(category, pattern_name)
+            if tool_name and tool_name != pattern_name:
+                self.permission_manager.approve_for_session(category, tool_name)
+            return True
+        elif choice == "y":
+            return True
+        else:
             return False

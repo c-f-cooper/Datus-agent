@@ -3,7 +3,9 @@
 | Tests | Execution | Boundary and assertions |
 | --- | --- | --- |
 | `tests/integration/agent/test_core_acceptance.py` | Code PRs | Production model adapter, Agents SDK, node loop, tools, SQLite and filesystem. Only remote model responses are scripted over HTTP. Covers chat, metadata discovery, SQL results, joins, follow-up context, tool error recovery, memory across sessions, init knowledge reuse, read-only enforcement, bounded tool results, plan confirmation and a queryable table product with its validator. |
-| `tests/integration/api/test_chat_acceptance.py` | Code PRs | Real FastAPI routes, task manager, chat service and model transport. Covers SQL, follow-up, history, session listing/deletion, user isolation, stop and subsequent reuse. |
+| `tests/integration/api/test_chat_acceptance.py` | Affected code PRs; Nightly core acceptance | Real FastAPI routes, task manager, chat service and model transport. Covers SQL, follow-up, history, user isolation, stop/reuse, terminal cleanup, replay expiry, project eviction and cancelled native SQL workers. |
+| `test_real_tool_concurrent_cold_connection_and_owner_eviction` in `test_func_tools_db.py` | Affected code PRs | Fully initialized database tools, real SQLite/DuckDB connections and concurrent queries. Checks one cold construction, bounded owner eviction, reopening and independent borrowers. No model calls. |
+| `tests/integration/storage/test_fastembed_lancedb_smoke.py` | Existing main Nightly group | Real FastEmbed/ONNX inference and LanceDB. Fresh-process concurrent loading and repeated wrapper lifetimes check one native session and emit RSS observations. No remote LLM calls; model assets must be available. |
 | `test_dosi_authoring_validates_reconciles_and_queries_without_llm` in `test_semantic_modeling_agentic.py` | Code PRs; existing dedicated Nightly group | Real Dosi authoring, validation, reconciliation and metric execution. No external model required. |
 | Capacity, image round-trip and native observability model contracts | Affected model / shared-runtime PRs | Real initialized adapters and SDK paths with external IO replaced. Includes nested JSON tool schemas and native model calls. |
 | Remaining affected unit tests | PR diff | Exact-file / longest-prefix unit owners retain explicit consumers, including harness-marked unit tests. Shared model adapters include observability and node consumers. |
@@ -16,15 +18,54 @@ Assertions check rows, files and persisted state, rather than exact answer wordi
 or exact generated SQL. Scripted acceptance verifies runtime wiring and effects;
 the real-model questions additionally assess tool selection and reasoning.
 
+Resource regressions for #1639–#1641 reuse these fixtures and execution groups.
+The HTTP cases drive real model adapters and tools using scripted local HTTP
+responses, including an actual provider error, stop and client disconnect. They
+check immediate connection returns, resume before a one-second test TTL, automatic
+expiry without another request, persisted history and repeated concurrent turns.
+Native SQL cancellation blocks inside SQLite itself to prove eviction waits for
+the worker. Project eviction verifies the original native handles are closed and
+that the next request rebuilds a working service. Object collection of successful
+nodes is checked after tracing drains. Error/cancel
+tracebacks can temporarily survive in the HTTP client's cancelled timeout
+handles, so those cases assert returned borrows and detached tool connections
+without depending on asyncio timer-heap GC. Resource closure is checked before
+waiting for TTL.
+
+Review regressions also hold real SQLite metadata execution across catalogue
+timeouts, table-detail/batch cancellation and project eviction. Active SSE cases
+cover service shutdown, cache shutdown and refreshed configuration generations.
+Unit cases check replay completion order, cancelled creation waiters, creator
+draining, retired-generation request protection and rejected post-close borrows.
+Concurrency unit tests rendezvous constructors with their real Future waiters
+instead of relying on sleeps. The expiry fixture observes actual timer callbacks
+and never performs the purge itself.
+
+Catalogue deadline cases require a timeout response while native SQLite remains
+blocked, then verify that a worker-owned service borrow prevents early disposal.
+Artifact-save cancellation cases invoke real function tools and SQL/metric save
+paths; under connection pressure, tool cleanup must wait for the save before the
+native connection can be evicted. Follow-up cases receive the previous `end`
+while cleanup is held, then verify next-turn admission and cancellation isolation.
+Device-isolation tests explicitly set CPU/CUDA inputs and cover a CUDA default.
+Faulted teardown checks release their leases in `finally` before executor join.
+
+The native embedding cases prefetch assets before measurement, then use three
+rounds of eight concurrent inferences in a fresh interpreter. Construction count,
+wrapper collection and live native-model count are hard assertions. RSS is
+reported as evidence without a platform-dependent memory threshold. These cases
+retain their existing `nightly` mark and are excluded from PR selection; the
+deterministic HTTP and database cases are selected through the existing map.
+
 ## Selection and evidence
 
 `coverage-map.yml` contains mandatory `execution.core_nodeids`, unit ownership
-rules and additive product impact rules. The 16 exact core nodeids run for runtime changes and changes to test selection,
+rules and additive product impact rules. The 19 exact core nodeids run for runtime changes and changes to test selection,
 execution or shared fixtures. Ordinary CI/workflow changes and test-only changes
 select their owners without adding the runtime core. Core and affected tests execute in one pytest session with file-level
 xdist distribution; whole-file selections subsume their core nodeids to prevent
 duplicate execution. Recollecting the previous 71-file fixed list on this tree
-selects 1,069 cases; the fixed requirement is now the 16 core cases, with the
+selects 1,069 cases; the fixed requirement is now the 19 core cases, with the
 remaining deterministic contracts selected by impact.
 For each changed source file, `execution.unit_rules` selects the exact file or
 longest matching directory prefix, including the consumers listed by that owner.
@@ -191,8 +232,10 @@ base, such as after the base advances, the metadata run performs fresh
 validation. Later edits can reuse that actual validation, but evidence-only
 copies never become sources. Missing or invalid base SHAs and API errors fail closed.
 Metadata-only events never cancel that validation.
-Merge-queue context publication lives in a separate merge-group-only workflow,
-so skipped jobs cannot compete with the real PR check contexts.
+Test Audit runs on PR events only; merge groups do not launch an audit job.
+Merge-queue quality contexts live in `merge-queue.yml`, which does not handle PR
+events. They run only on `merge_group`; manual dispatches use distinct, non-required
+job names so skipped jobs cannot compete with the real PR check contexts.
 
 Merge Queue runs only generated tool catalog validation and strict coverage-map
 validation on the merged tree. It installs PyYAML without the Agent environment,
@@ -201,7 +244,8 @@ checks and propagates failures to the required `Merge Queue Gate` context. This
 catches catalog/map conflicts introduced by combining PRs; behavior tests remain
 owned by PR CI. Native packages, real services and model quality remain owned by
 Nightly, dedicated acceptance and release validation. No test-result cache is
-introduced.
+introduced. Queue failures remain visible through GitHub checks and run artifacts;
+automatic PR failure comments and Feishu notifications are no longer sent.
 
 ## SQL policy host acceptance
 
@@ -217,7 +261,10 @@ by default. The optional `policy_release` workflow input selects an explicit sta
 tag for reproduction. One Release response selects the asset IDs for the entire
 run; the wheel, platform build manifest and checksums all come from that response.
 The helper verifies the runner's Python/platform tags, asset digests, SHA256SUMS,
-release/source identity and compatibility with the installed published Dosi wheel.
+release/source identity and that the manifest declares a valid Dosi host requirement.
+A version mismatch emits a warning and allows preparation to continue.
+`SQL Policy Plugin Tests` checks compatibility by executing protected queries with
+the installed Dosi version.
 Drafts, prereleases, incompatible/missing assets and failed checks stop preparation;
 there is no source-build fallback.
 
@@ -231,14 +278,15 @@ and Dosi stays on its published dependency. Nightly performs no Policy/Dosi Rust
 builds; Policy's own build/release workflows own those checks.
 
 `sql-policy-release.json` evidence records the resolved tag, release/asset IDs,
-source/API revisions, Agent commit, installed Dosi version and wheel hash. It is
-included in `nightly-manifest.json` and uploaded with the test results. Payloads and
-credentials are not uploaded. A fresh per-run directory holds downloaded assets
-and is removed after evidence upload; credentials are scoped to the download step.
+source/API revisions, Agent commit, declared Dosi requirement, installed Dosi version
+and wheel hash. It is included in `nightly-manifest.json` and uploaded with the test
+results. Payloads and credentials are not uploaded. A fresh per-run directory holds
+downloaded assets and is removed after evidence upload; credentials are scoped to
+the download step.
 The final notification requires both successful Release preparation and tests.
 
-The independent `sql-policy-gate.yml` source-build verifier is retained for existing
-callers, but Nightly no longer invokes it.
+The local `ci/sql_policy_gate.py` source-build diagnostic tool remains available;
+its reusable GitHub Actions workflow has been removed. Nightly does not invoke it.
 
 Local reproduction in the locked Agent environment:
 
@@ -314,10 +362,11 @@ Live core defaults to `deepseek/deepseek-v4-flash` with `DEEPSEEK_API_KEY`.
 
 Changes to BI tools, validation, Superset authoring/validation skills, their tests,
 dependencies, or CI select `Superset Product Tests` in the product test plan. Scheduled
-Nightly runs this group; it is not a merge-queue dependency. The separate
-`merge-queue-pr.yml` workflow publishes the lightweight PR context without a
-checkout or reusable workflow call. The standalone BI gate uses pinned BI and plugin fixtures declared in `ci/bi_gate.py`, the existing
-self-hosted CI credential template, and dynamically allocated loopback Docker ports.
+Nightly runs this group; it is not a merge-queue dependency. The PR-only `Code Quality`
+workflow publishes the lightweight `Merge Queue Gate` context in a job without a
+checkout or reusable workflow call. The local `ci/bi_gate.py` diagnostic tool uses
+pinned BI and plugin fixtures and dynamically allocated loopback Docker ports;
+its reusable GitHub Actions workflow has been removed.
 It runs the deterministic chart repair/delete contract, managed plugin installation,
 and real-model dashboard creation. Missing, skipped, or failed execution receipts fail the gate.
 

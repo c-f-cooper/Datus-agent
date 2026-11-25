@@ -86,7 +86,10 @@ def environment(tmp_path):
         db=db,
         semantic=semantic,
         runtime=runtime,
-        config=SimpleNamespace(project_root=str(tmp_path)),
+        config=SimpleNamespace(
+            project_root=str(tmp_path),
+            services=SimpleNamespace(datasources={"warehouse": SimpleNamespace(datasource_id="")}),
+        ),
     )
 
 
@@ -322,6 +325,27 @@ def test_metric_bundle_validation_rejects_mismatched_sidecars(environment, chang
         data["sql"] = "SELECT 0"
         path.write_text(json.dumps(data))
     assert "Invalid saved metric query" in tools._validate_metric_queries("report")
+
+
+@pytest.mark.parametrize(
+    "cls, tool_name",
+    [(ReportArtifactTools, "save_query"), (DashboardArtifactTools, "save_query_template")],
+)
+@pytest.mark.parametrize("with_semantic_tools", [False, True])
+def test_raw_sql_tool_schema_reflects_fallback_contract(environment, cls, tool_name, with_semantic_tools):
+    tools = cls(
+        agent_config=environment.config,
+        db_func_tool=environment.db,
+        semantic_tools=environment.semantic if with_semantic_tools else None,
+    )
+    tool = next(tool for tool in tools.available_tools() if tool.name == tool_name)
+    schema = tool.params_json_schema
+    assert ("fallback_reason" in schema["required"]) is with_semantic_tools
+    assert "candidate_metrics" not in schema["required"]
+    candidates = schema["properties"]["candidate_metrics"]
+    array = next(option for option in candidates["anyOf"] if option.get("type") == "array")
+    item = schema["$defs"][array["items"]["$ref"].split("/")[-1]]
+    assert set(item["required"]) == {"path", "name"}
 
 
 def test_sql_fallback_requires_recorded_reason_and_clears_previous_metric_source(environment):
@@ -646,6 +670,8 @@ def test_published_execution_uses_saved_model_after_studio_changes(environment, 
             self.path = Path(config.semantic_model_path)
             assert self.path.read_bytes() == original
             assert config.semantic_models_path is None
+            assert config.ontology_dir is None
+            assert config.db_config == {"type": "duckdb", "database": "warehouse"}
             if normalizes_model:
                 self.path.write_text("version: 0.2.0.dev0\nname: model\ndatasets: []\n")
 
@@ -663,7 +689,13 @@ def test_published_execution_uses_saved_model_after_studio_changes(environment, 
     monkeypatch.setattr("datus.tools.semantic_tools.dosi.DosiRuntime", FrozenRuntime)
     policy = {"reader": "alice"}
     result, _ = execute_published_metric_query(
-        query, runtime_config=DosiConfig(), db_tool=env.db, params={}, policy_context=policy
+        query,
+        runtime_config=DosiConfig(
+            ontology_dir=str(env.model.parent), db_config={"type": "duckdb", "database": "warehouse"}
+        ),
+        db_tool=env.db,
+        params={},
+        policy_context=policy,
     )
     assert result.rows == [{"revenue": 25.0}]
     assert env.db.execute_read_enforced.call_args.kwargs["policy_context"] == policy
@@ -737,7 +769,11 @@ def test_model_files_are_tool_managed(environment, kind, operation):
 def _install_metric_policy(env, monkeypatch, allowed, *, region="North"):
     original_binding = env.runtime.artifact_metric_binding
     env.runtime.artifact_metric_binding = lambda name: {**original_binding(name), "datasets": ["orders"]}
-    env.db.agent_config = SimpleNamespace(active_plugin_names=lambda: {"scope"}, get_plugin_profile=lambda _: {})
+    env.db.agent_config = SimpleNamespace(
+        services=SimpleNamespace(datasources={"warehouse": SimpleNamespace(datasource_id="")}),
+        active_plugin_names=lambda: {"scope"},
+        get_plugin_profile=lambda _: {},
+    )
 
     contexts = []
 
@@ -785,7 +821,11 @@ def test_native_artifact_policies_apply_once_at_the_final_sql_boundary(environme
 
     env = environment
     context = {"sql_policy": {"version": "request", "policies": {}}}
-    env.db.agent_config = SimpleNamespace(active_plugin_names=lambda: {"sql-policy"}, get_plugin_profile=lambda _: {})
+    env.db.agent_config = SimpleNamespace(
+        services=SimpleNamespace(datasources={"warehouse": SimpleNamespace(datasource_id="")}),
+        active_plugin_names=lambda: {"sql-policy"},
+        get_plugin_profile=lambda _: {},
+    )
 
     class NativePolicy:
         def validate_context(self, value):
@@ -1025,7 +1065,7 @@ def test_metric_artifact_replays_its_original_database_after_a_turn_switch(envir
     assert result.success == 1, result.error
     saved = MetricQueryFile.model_validate_json((tools.queries_dir / "sales.metric.json").read_text())
     assert saved.execution_context == {
-        "datasource": "warehouse",
+        "datasource_id": "warehouse",
         "database": "shop",
         "catalog": "",
         "schema": "tenant_a" if engine == "duckdb" else "",
@@ -1043,6 +1083,7 @@ def test_metric_artifact_replays_its_original_database_after_a_turn_switch(envir
     assert current.execute_query("SELECT SUM(amount) AS total FROM orders", result_format="list").sql_return == [
         {"total": 999.0}
     ]
+    env.db.close()
     manager.close()
 
 
@@ -1054,7 +1095,7 @@ async def test_dashboard_rejects_a_saved_context_pointing_at_another_datasource(
     assert saved.success == 1, saved.error
     path = tools.queries_dir / f"sales{suffix}"
     content = json.loads(path.read_text())
-    content["execution_context"]["datasource"] = "other"
+    content["execution_context"]["datasource_id"] = "other"
     path.write_text(json.dumps(content))
     env.db.execute_read_enforced.reset_mock()
     service = DashboardService(agent_config=env.config)
@@ -1080,8 +1121,8 @@ def test_metric_save_and_finalize_share_the_query_source_contract(environment, k
     assert result.success == 1, result.error
     root = tools.dashboard_dir if kind == "dashboard" else tools.report_dir
     meta_path = tools.queries_dir / ("sales.params.json" if kind == "dashboard" else "sales.json")
-    assert json.loads(meta_path.read_text())["datasource"] == "warehouse"
-    assert json.loads((root / "manifest.json").read_text())["datasources"] == []
+    assert json.loads(meta_path.read_text())["datasource_id"] == "warehouse"
+    assert json.loads((root / "manifest.json").read_text())["datasource_ids"] == []
     model = Mock(spec=["generate_with_json_output", "generate"])
     model.generate_with_json_output.side_effect = RuntimeError("narrative unavailable")
     run_finalize_analysis(
@@ -1092,4 +1133,234 @@ def test_metric_save_and_finalize_share_the_query_source_contract(environment, k
         analysis_dir=root / "analysis",
         actions=[],
     )
-    assert json.loads((root / "manifest.json").read_text())["datasources"] == ["warehouse"]
+    assert json.loads((root / "manifest.json").read_text())["datasource_ids"] == ["warehouse"]
+
+
+@pytest.mark.parametrize("kind", ["report", "dashboard"])
+def test_metric_artifact_identity_survives_rename_without_changing_model_snapshot(environment, kind):
+    from datus.configuration.agent_config import DbConfig
+
+    env = environment
+    entry = DbConfig()
+    entry.datasource_id = "stable"
+    cfg = SimpleNamespace(services=SimpleNamespace(datasources={"warehouse": entry}))
+    env.db.agent_config = cfg
+    options = {"params": [], "sample_params": {}} if kind == "dashboard" else {}
+    tools, result = _save(env, kind, **options)
+    assert result.success == 1, result.error
+    path = tools.queries_dir / "sales.metric.json"
+    before = path.read_bytes()
+    saved = MetricQueryFile.model_validate_json(before)
+    assert saved.datasource_id == "stable"
+    assert "datasource" not in json.loads(before)
+    cfg.services.datasources = {"renamed": entry}
+    original = env.runtime.artifact_metric_binding
+    env.runtime.artifact_metric_binding = lambda name: {**original(name), "datasource": "renamed"}
+    payload, _ = execute_metric_artifact_query(
+        saved, saved=saved, semantic_tools=env.semantic, db_tool=env.db, project_root=env.root
+    )
+    assert payload.rows == [{"revenue": 25.0}]
+    assert payload.datasource_id == "stable"
+    assert env.db.execute_read_enforced.call_args.kwargs["datasource"] == "renamed"
+    assert path.read_bytes() == before
+    assert hashlib.sha256(env.model.read_bytes()).hexdigest() == saved.model_revision
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["report", "dashboard"])
+async def test_cancelled_metric_save_finishes_before_database_tool_cleanup(environment, monkeypatch, kind):
+    import asyncio
+    import threading
+    from functools import wraps
+
+    from datus.tools.db_tools.connection_scope import _lifetime
+    from datus.tools.func_tool.base import trans_to_function_tool
+
+    env = environment
+    connector = env.db.connector
+    connector.execute_query("SELECT 1")
+    entered, release, draining, finished = (threading.Event() for _ in range(4))
+
+    def hold():
+        entered.set()
+        assert release.wait(timeout=10)
+        return 0
+
+    connector.connection.set_progress_handler(hold, 1)
+    cls = {"report": ReportArtifactTools, "dashboard": DashboardArtifactTools}[kind]
+    artifact = cls(agent_config=env.config, db_func_tool=env.db, semantic_tools=env.semantic)
+    start = getattr(artifact, {"report": "start_new_report", "dashboard": "start_new_dashboard"}[kind])
+    assert start("resource", "Resource lifetime", "Verify metric save lifetime").success == 1
+    name = {"report": "save_metric_query", "dashboard": "save_metric_query_template"}[kind]
+    save = getattr(cls, name)
+    results = []
+
+    @wraps(save)
+    def observe_save(self, *args, **kwargs):
+        try:
+            result = save(self, *args, **kwargs)
+            results.append(result)
+            return result
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(cls, name, observe_save)
+    condition = _lifetime(env.db).condition
+    wait = condition.wait
+
+    def observe_drain(timeout=None):
+        draining.set()
+        return wait(timeout)
+
+    monkeypatch.setattr(condition, "wait", observe_drain)
+    arguments = {
+        "name": "total",
+        "query": {"metric": REF},
+        "goal": "Revenue",
+        "hypothesis": "Revenue is 25",
+        **{"report": {}, "dashboard": {"params": [], "sample_params": {}}}[kind],
+    }
+    function = trans_to_function_tool(getattr(artifact, name), strict_mode=False)
+    invocation = asyncio.create_task(function.on_invoke_tool(None, json.dumps(arguments)))
+    closing = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 5), [result.model_dump() for result in results]
+        invocation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await invocation
+        closing = asyncio.create_task(asyncio.to_thread(env.db.close))
+        assert await asyncio.to_thread(draining.wait, 5)
+        assert env.db.connector is connector
+        release.set()
+        await asyncio.wait_for(closing, timeout=5)
+        assert await asyncio.to_thread(finished.wait, 5)
+        assert len(results) == 1
+        assert results[0].success == 1, results[0].error
+        assert results[0].result["preview_rows"] == [{"revenue": 25.0}]
+        assert env.db.connector is None
+    finally:
+        release.set()
+        invocation.cancel()
+        await asyncio.gather(invocation, *([closing] if closing is not None else []), return_exceptions=True)
+        await asyncio.to_thread(env.db.close)
+        await asyncio.to_thread(connector.close)
+
+
+@pytest.mark.parametrize("kind", ["report", "dashboard"])
+def test_split_output_root_preserves_source_model_identity(environment, kind):
+    env = environment
+    env.config.artifact_output_root = str(env.root / "personal" / "files")
+    options = {"params": [], "sample_params": {}} if kind == "dashboard" else {}
+    tools, saved = _save(env, kind, **options)
+    assert saved.success == 1, saved.error
+    recipe = MetricQueryFile.model_validate_json((tools.queries_dir / "sales.metric.json").read_text())
+    assert recipe.model_path == env.model.relative_to(env.root).as_posix()
+    assert tools.queries_dir.is_relative_to(env.root / "personal" / "files")
+    assert (tools.queries_dir.parent / recipe.model_snapshot_path).read_bytes() == env.model.read_bytes()
+    assert not (env.root / f"{kind}s").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_builder_metric_preview_uses_artifact_snapshot_without_source_model(environment, monkeypatch, legacy):
+    from pathlib import Path
+
+    from datus.tools.semantic_tools.dosi.config import DosiConfig
+
+    env = environment
+    # Produce a valid artifact before separating the runtime roots, so this test
+    # exercises preview independently of the producer's source-root regression.
+    tools, saved = _save(env, "dashboard", params=[], sample_params={})
+    assert saved.success == 1, saved.error
+    original = env.model.read_bytes()
+    if legacy:
+        recipe_path = tools.queries_dir / "sales.metric.json"
+        recipe = json.loads(recipe_path.read_text())
+        recipe.update(schema_version="1.0", model_snapshot_path=None, model_snapshot=original.decode())
+        recipe_path.write_text(json.dumps(recipe))
+    env.config.artifact_output_root = str(env.root)
+    env.config.project_root = str(env.root / "frozen-context")
+    env.model.unlink()
+
+    class FrozenRuntime:
+        def __init__(self, config):
+            self.path = Path(config.semantic_model_path)
+            assert self.path.read_bytes() == original
+
+        def artifact_metric_binding(self, name):
+            return {
+                "model_path": str(self.path),
+                "model_revision": hashlib.sha256(original).hexdigest(),
+                "datasource": "warehouse",
+            }
+
+        async def query_metrics(self, **kwargs):
+            return await env.runtime.query_metrics(**kwargs)
+
+    env.runtime.config = DosiConfig()
+    env.semantic.runtime_connection_config = lambda: env.runtime.config
+    monkeypatch.setattr("datus.tools.semantic_tools.dosi.DosiRuntime", FrozenRuntime)
+    monkeypatch.setattr("datus.tools.func_tool.DBFuncTool", lambda **kwargs: env.db)
+    monkeypatch.setattr("datus.tools.func_tool.semantic_tools.SemanticTools", lambda **kwargs: env.semantic)
+    policy = {"reader": "alice"}
+    result = await DashboardService(agent_config=env.config).run_query(
+        project_files_root=env.root, dashboard_slug="demo", query_slug="sales", params={}, policy_context=policy
+    )
+    assert result.success is True, result.errorMessage
+    assert result.data.rows == [{"revenue": 25.0}]
+    assert env.db.execute_read_enforced.call_args.kwargs["policy_context"] is policy
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["report", "dashboard"])
+async def test_split_roots_compile_and_execute_native_metric_snapshot(environment, kind):
+    from datus.configuration.agent_config import AgentConfig
+    from datus.tools.func_tool.semantic_tools import SemanticTools
+    from tests.helpers.product_acceptance import isolated_connectors
+
+    env = environment
+    env.model.write_text("""version: 0.2.0.dev0
+name: shop
+datasets:
+  - name: orders
+    source: orders
+    fields:
+      - name: amount
+        expression: {dialects: [{dialect: ANSI_SQL, expression: amount}]}
+metrics:
+  - name: revenue
+    expression: {dialects: [{dialect: ANSI_SQL, expression: 'SUM(orders.amount)'}]}
+""")
+    env.config = AgentConfig(
+        nodes={},
+        home=str(env.root / "home"),
+        project_root=str(env.root),
+        artifact_output_root=str(env.root / "personal" / "files"),
+        services={
+            "datasources": {"warehouse": {"type": "sqlite", "uri": str(env.root / "shop.sqlite"), "default": True}}
+        },
+        agentic_nodes={"gen_visual_dashboard": {"db_read_only": True}},
+    )
+    env.config.current_datasource = "warehouse"
+    env.db.agent_config = env.config
+    with isolated_connectors():
+        semantic = SemanticTools(agent_config=env.config, sub_agent_name="gen_visual_dashboard")
+        # The subject index supplies identity; model discovery/compilation and
+        # warehouse reads below use the real native runtime and SQLite.
+        semantic.metric_record = env.semantic.metric_record
+        env.semantic = semantic
+        options = {"params": [], "sample_params": {}} if kind == "dashboard" else {}
+        tools, saved = _save(env, kind, **options)
+        assert saved.success == 1, saved.error
+        env.model.unlink()
+        if kind == "dashboard":
+            response = await DashboardService(agent_config=env.config).run_query(
+                project_files_root=tools.queries_dir.parent.parent.parent,
+                dashboard_slug="demo",
+                query_slug="sales",
+                params={},
+            )
+            assert response.success is True, response.errorMessage
+            assert response.data.rows == [{"revenue": 25.0}]
+        else:
+            assert json.loads((tools.queries_dir / "sales.json").read_text())["rows"] == [{"revenue": 25.0}]

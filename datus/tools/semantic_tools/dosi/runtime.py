@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import yaml
 
+from datus.storage.semantic_model.artifact_file import semantic_bundle_read_lock
 from datus.tools.semantic_tools.authoring import MetricMutationResult, MetricSource
 from datus.tools.semantic_tools.dosi.authoring import dosi_validation_text_payload
 from datus.tools.semantic_tools.dosi.config import DosiConfig
@@ -48,8 +49,6 @@ from datus.tools.semantic_tools.dosi.model import (
 )
 from datus.tools.semantic_tools.exceptions import SemanticCoreException
 from datus.tools.semantic_tools.models import (
-    AttributionRequest,
-    AttributionResult,
     DimensionInfo,
     MetricDefinition,
     QueryResult,
@@ -182,21 +181,37 @@ class DosiRuntime:
 
     # ==================== Metrics Interface ====================
 
+    def _metric_snapshot(self, model_path: str, handle: EngineHandle):
+        with semantic_bundle_read_lock(model_path, self.config.ontology_dir):
+            engine = handle.get()
+            return engine.metrics(), engine.datasets(), engine.dimensions(), self._metric_payloads(model_path)
+
     async def list_metrics(
         self,
         path: Optional[List[str]] = None,
         limit: int = 100,
         offset: int = 0,
     ) -> List[MetricDefinition]:
-        extension_version = await asyncio.to_thread(datus_extension_version)
-        handles, _, _ = await asyncio.to_thread(self._catalog)
+        return await asyncio.to_thread(self.list_metrics_sync, path=path, limit=limit, offset=offset)
+
+    def list_metrics_sync(
+        self,
+        path: Optional[List[str]] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[MetricDefinition]:
+        """List metrics on the calling thread, preserving artifact-lock ownership.
+
+        Synchronous publishers already hold the model's reentrant thread lock.
+        Sending any part of this read to another thread would deadlock against
+        that publisher. Async callers use ``list_metrics`` to offload the whole
+        operation without blocking their event loop.
+        """
+        extension_version = datus_extension_version()
+        handles, _, _ = self._catalog()
         metrics = []
         for model_path, handle in handles:
-            engine = await asyncio.to_thread(handle.get)
-            rows = await asyncio.to_thread(engine.metrics)
-            dataset_rows = await asyncio.to_thread(engine.datasets)
-            dimension_rows = await asyncio.to_thread(engine.dimensions)
-            payloads = await asyncio.to_thread(self._metric_payloads, model_path)
+            rows, dataset_rows, dimension_rows, payloads = self._metric_snapshot(model_path, handle)
             for row in rows:
                 hints = payloads.get(str(row.get("name") or ""), {})
                 metric_path = (
@@ -858,41 +873,43 @@ class DosiRuntime:
         columns, rows = self._label_requested_columns(result, dataset_names)
         return QueryResult(columns=columns, data=rows, metadata=metadata)
 
-    async def attribute(self, request: AttributionRequest) -> AttributionResult:
-        """Delegate attribution to the native engine that owns the metric."""
-        dimensions = list(dict.fromkeys(dimension.strip() for dimension in request.dimensions if dimension.strip()))
-        if not dimensions:
-            raise SemanticValidationException(
-                SemanticValidationError(
-                    code="dimensions_required",
-                    metrics=[request.metric],
-                    message=(
-                        "Attribution requires at least one candidate dimension; "
-                        "call get_dimensions and retry with the selected dimensions."
-                    ),
-                )
-            )
+    async def attribute_metrics(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Explain a metric's change over its formula (Dosi ``Engine.attribute_metrics``).
+
+        ``request`` is Dosi's: the metric query's fields with two periods,
+        ``baseline`` and ``current``, in place of one. The result is Dosi's
+        ``schema_version: 3`` result, returned as is: a metric that cannot be
+        attributed still has one, with a status and the issues that say why.
+        """
+        return await self._attribute("attribute_metrics", request)
+
+    async def attribute_dimensions(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Explain a metric's change by the groups of its ``dimensions``
+        (Dosi ``Engine.attribute_dimensions``); otherwise as ``attribute_metrics``."""
+        return await self._attribute("attribute_dimensions", request)
+
+    async def _attribute(self, method: str, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Run one of Dosi's two attribution tools on the engine owning the metric,
+        under the same read policy and timeout as a query."""
+        metric = str(request.get("metric") or "")
         policy_kwargs = await asyncio.to_thread(self._policy_kwargs)
         binding = await asyncio.to_thread(load_binding)
-        handle = await asyncio.to_thread(self._handle_for_metric, request.metric)
+        handle = await asyncio.to_thread(self._handle_for_metric, metric)
         engine = await asyncio.to_thread(handle.get)
-        native_request = request.model_dump(mode="python", exclude_none=True)
-        native_request["dimensions"] = dimensions
         try:
-            result = await asyncio.to_thread(
-                engine.attribute,
-                native_request,
+            return await asyncio.to_thread(
+                getattr(engine, method),
+                dict(request),
                 connection=handle.profile_name,
                 timeout_secs=float(self.config.timeout_seconds),
                 **policy_kwargs,
             )
-            return AttributionResult.model_validate({**result, "implementation": "dosi"})
         except Exception as exc:  # noqa: BLE001 - mapped to typed errors below
             raise_mapped(
                 exc,
                 binding,
-                requested_metrics=[request.metric],
-                requested_dimensions=dimensions,
+                requested_metrics=[metric],
+                requested_dimensions=[str(d) for d in request.get("dimensions") or []],
             )
             raise  # unreachable; raise_mapped always raises
 

@@ -561,6 +561,7 @@ class TestAllToolsNameContract:
         for method in (
             "to_function_tool",
             "available_tools",
+            "close",
             "read_query",
             "execute_write",
             "execute_ddl",
@@ -764,3 +765,260 @@ def test_mixed_datasource_scopes_enforce_real_sqlite_and_duckdb_reads(tmp_path, 
     finally:
         for name in configs:
             manager.get_conn(name).close()
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("engine", ["sqlite", "duckdb"])
+def test_real_tool_concurrent_cold_connection_and_owner_eviction(tmp_path, monkeypatch, engine):
+    """Full tool construction uses one cold native connector and reopens evicted files."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    import duckdb
+
+    from datus.tools.db_tools.db_manager import DBManager
+    from tests.helpers.product_acceptance import isolated_connectors, product_config
+
+    connect = sqlite3.connect if engine == "sqlite" else duckdb.connect
+    markers = {"one": 11, "two": 22, "three": 33, "four": 44}
+    for name, marker in markers.items():
+        with connect(str(tmp_path / f"{name}.{engine}")) as database:
+            database.execute("CREATE TABLE marker(value INTEGER)")
+            database.execute(f"INSERT INTO marker VALUES ({marker})")
+    config = product_config(
+        tmp_path / "project",
+        "http://127.0.0.1:1/v1",
+        datasources={
+            "warehouse": {
+                "type": engine,
+                "path_pattern": str(tmp_path / f"*.{engine}"),
+                "database": "one",
+                "default": True,
+            }
+        },
+    )
+    config.current_datasource = "warehouse"
+    with isolated_connectors():
+        manager = DBManager(config.datasource_configs, max_connections=2)
+        build = manager._build_conn
+        created = []
+        lock = threading.Lock()
+
+        def observed_build(bound_config):
+            connector = build(bound_config)
+            with lock:
+                created.append((bound_config.database, connector))
+            # Keep the actual constructor's cold window open for concurrent
+            # callers; construction, connect(), queries and eviction stay real.
+            time.sleep(0.02)
+            return connector
+
+        monkeypatch.setattr(manager, "_build_conn", observed_build)
+        tool = DBFuncTool(manager, agent_config=config, default_datasource="warehouse")
+        start = threading.Barrier(4)
+
+        def query():
+            start.wait(timeout=5)
+            return tool.read_query("SELECT value FROM marker", datasource="warehouse", database="two", compress=False)
+
+        try:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                results = [future.result(timeout=10) for future in [pool.submit(query) for _ in range(4)]]
+            assert all(result.success == 1 and result.result == [{"value": 22}] for result in results)
+            assert sum(name == "two" for name, _ in created) == 1
+            original = next(connector for name, connector in created if name == "two")
+            for name in ("three", "four"):
+                result = tool.read_query(
+                    "SELECT value FROM marker", datasource="warehouse", database=name, compress=False
+                )
+                assert result.success == 1, result.error
+                assert result.result == [{"value": markers[name]}]
+                assert len(manager._conn_dict["warehouse"]) <= 2
+            assert original.connection is None, "Owner eviction must close the real native connection"
+            result = tool.read_query("SELECT value FROM marker", datasource="warehouse", database="two", compress=False)
+            assert result.success == 1 and result.result == [{"value": 22}]
+            assert sum(name == "two" for name, _ in created) == 2
+            # Another fully initialized tool borrows the same manager. Closing
+            # its peer cannot invalidate the remaining borrower's primary DB.
+            shared = DBFuncTool(manager, agent_config=config, default_datasource="warehouse")
+            try:
+                tool.close()
+                result = shared.read_query("SELECT value FROM marker", compress=False)
+                assert result.success == 1 and result.result == [{"value": 11}]
+            finally:
+                shared.close()
+        finally:
+            tool.close()
+            manager.close()
+        assert all(connector.connection is None for _, connector in created)
+
+
+@pytest.mark.acceptance
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["report", "dashboard"])
+async def test_cancelled_artifact_worker_retains_native_connection_until_save_finishes(tmp_path, monkeypatch, kind):
+    """The outer model tool owns its DB operation after its awaiter is cancelled."""
+    import asyncio
+    import threading
+    from contextlib import ExitStack
+    from functools import wraps
+
+    from datus.tools.db_tools.connection_scope import _lifetime
+    from datus.tools.db_tools.db_manager import DBManager
+    from datus.tools.func_tool import DashboardArtifactTools, ReportArtifactTools
+    from tests.helpers.product_acceptance import isolated_connectors, product_config
+
+    for index in range(9):
+        with sqlite3.connect(tmp_path / f"db{index}.sqlite") as database:
+            database.execute("CREATE TABLE marker(value INTEGER)")
+    config = product_config(
+        tmp_path / "project",
+        "http://127.0.0.1:1/v1",
+        datasources={
+            "warehouse": {
+                "type": "sqlite",
+                "path_pattern": str(tmp_path / "*.sqlite"),
+                "database": "db0",
+                "default": True,
+            }
+        },
+    )
+    config.current_datasource = "warehouse"
+    with isolated_connectors(), ExitStack() as cleanup:
+        manager = DBManager(config.datasource_configs)
+        cleanup.callback(manager.close)
+        tool = DBFuncTool(manager, agent_config=config, default_datasource="warehouse")
+        cleanup.callback(tool.close)
+        connector = tool.connector
+        connector.execute_query("SELECT 1")
+        entered, release, draining, finished = (threading.Event() for _ in range(4))
+        cleanup.callback(release.set)
+        results = []
+        leases = [manager.acquire_conn("warehouse", f"db{index}") for index in range(1, 9)]
+
+        for lease in leases:
+            cleanup.callback(lease.release)
+
+        def hold():
+            entered.set()
+            assert release.wait(timeout=10)
+            return 350
+
+        connector.connection.create_function("artifact_hold", 0, hold)
+        artifact_type = {"report": ReportArtifactTools, "dashboard": DashboardArtifactTools}[kind]
+        artifact = artifact_type(agent_config=config, db_func_tool=tool)
+        start = getattr(artifact, {"report": "start_new_report", "dashboard": "start_new_dashboard"}[kind])
+        assert start("resource", "Resource lifetime", "Verify a native query lifetime").success == 1
+        name = {"report": "save_query", "dashboard": "save_query_template"}[kind]
+        save = getattr(artifact_type, name)
+
+        @wraps(save)
+        def observe_save(self, *args, **kwargs):
+            try:
+                result = save(self, *args, **kwargs)
+                results.append(result)
+                return result
+            finally:
+                finished.set()
+
+        monkeypatch.setattr(artifact_type, name, observe_save)
+        condition = _lifetime(tool).condition
+        wait = condition.wait
+
+        def observe_drain(timeout=None):
+            draining.set()
+            return wait(timeout)
+
+        monkeypatch.setattr(condition, "wait", observe_drain)
+        arguments = {
+            "name": "total",
+            "goal": "Compute total",
+            "hypothesis": "The total is 350",
+            "fallback_reason": "The isolated datasource has no semantic metric.",
+            **{
+                "report": {"sql": "SELECT artifact_hold() AS total"},
+                "dashboard": {"sql_template": "-- @datus-params\nSELECT artifact_hold() AS total", "sample_params": {}},
+            }[kind],
+        }
+        function = trans_to_function_tool(getattr(artifact, name), strict_mode=False)
+        invocation = asyncio.create_task(function.on_invoke_tool(None, json.dumps(arguments)))
+        closing = None
+        try:
+            assert await asyncio.to_thread(entered.wait, 5), [result.model_dump() for result in results]
+            invocation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await invocation
+            closing = asyncio.create_task(asyncio.to_thread(tool.close))
+            assert await asyncio.to_thread(draining.wait, 5)
+            assert closing.done() is False
+            assert connector in manager._conn_dict["warehouse"].values()
+            release.set()
+            await asyncio.wait_for(closing, timeout=5)
+            assert await asyncio.to_thread(finished.wait, 5)
+            assert len(results) == 1
+            assert results[0].success == 1, results[0].error
+            assert results[0].result["preview_rows"] == [{"total": 350}]
+            # Eight other active leases leave this as the only eviction
+            # candidate. It can close only after the native artifact save.
+            assert connector.connection is None
+        finally:
+            release.set()
+            invocation.cancel()
+            await asyncio.gather(invocation, *([closing] if closing is not None else []), return_exceptions=True)
+            await asyncio.to_thread(tool.close)
+            for lease in leases:
+                lease.release()
+            await asyncio.to_thread(manager.close)
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("relations", ["private.payroll CROSS JOIN payroll", "payroll CROSS JOIN private.payroll"])
+def test_cte_name_collision_cannot_hide_attached_sqlite_table(relations):
+    from datus.tools.db_tools.config import SQLiteConfig
+    from datus.tools.db_tools.sqlite_connector import SQLiteConnector
+
+    connector = SQLiteConnector(SQLiteConfig(db_path=":memory:", database_name="main"))
+    try:
+        connector.connect()
+        connector.connection.executescript(
+            "CREATE TABLE orders (id INTEGER); INSERT INTO orders VALUES (1);"
+            "ATTACH DATABASE ':memory:' AS private;"
+            "CREATE TABLE private.payroll (salary INTEGER); INSERT INTO private.payroll VALUES (9000);"
+        )
+        sql = f"WITH payroll AS (SELECT 1 AS x) SELECT private.payroll.salary FROM {relations}"
+        # This is executable SQL, not an ambiguous-name parse rejection.
+        assert connector.connection.execute(sql).fetchone()[0] == 9000
+        tool = DBFuncTool(connector, scoped_tables={"main.orders"})
+        ordinary = tool.read_query("SELECT salary FROM private.payroll")
+        collision = tool.read_query(sql)
+        assert ordinary.success == 0 and "outside scoped context" in ordinary.error
+        assert collision.success == 0 and "outside scoped context" in collision.error
+        allowed = tool.read_query(
+            "WITH orders AS (SELECT 1 AS x) SELECT main.orders.id FROM main.orders CROSS JOIN orders"
+        )
+        assert allowed.success == 1, allowed.error
+    finally:
+        connector.close()
+
+
+@pytest.mark.acceptance
+def test_sqlite_implicit_recursive_cte_keeps_qualified_physical_references_scoped():
+    from datus.tools.db_tools.config import SQLiteConfig
+    from datus.tools.db_tools.sqlite_connector import SQLiteConnector
+
+    connector = SQLiteConnector(SQLiteConfig(db_path=":memory:", database_name="main"))
+    try:
+        connector.connect()
+        connector.connection.executescript("CREATE TABLE seq (n INTEGER); INSERT INTO seq VALUES (1);")
+        tool = DBFuncTool(connector, scoped_tables={"main.allowed"})
+        recursive = "WITH seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<3) SELECT * FROM seq"
+        assert [row[0] for row in connector.connection.execute(recursive)] == [1, 2, 3]
+        allowed = tool.read_query(recursive)
+        assert allowed.success == 1, allowed.error
+        physical = "WITH seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM main.seq WHERE n<3) SELECT * FROM seq"
+        assert [row[0] for row in connector.connection.execute(physical)] == [1, 2]
+        denied = tool.read_query(physical)
+        assert denied.success == 0 and "outside scoped context" in denied.error
+    finally:
+        connector.close()

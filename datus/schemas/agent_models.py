@@ -4,7 +4,9 @@
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictStr, ValidationInfo, field_validator
+
+from datus.configuration.legacy_tool_names import expand_replaced_tools
 
 
 class ScopedContextLists(BaseModel):
@@ -25,6 +27,22 @@ class ScopedContext(BaseModel):
     )
     metrics: Optional[str] = Field(default=None, init=True, description="Metrics to be used by sub-agents")
     sqls: Optional[str] = Field(default=None, init=True, description="Reference SQL to be used by sub-agents")
+    project_files: Optional[List[StrictStr]] = Field(default=None, description="Project-relative file paths or globs")
+
+    @field_validator("project_files")
+    @classmethod
+    def validate_project_files(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        """Normalize explicit file selections without changing legacy KB-scope semantics."""
+        if value is None:
+            return None
+        result = []
+        for item in value:
+            item = item.strip()
+            if not item:
+                raise ValueError("Project file selections must not be empty")
+            if item not in result:
+                result.append(item)
+        return result
 
     @property
     def is_empty(self) -> bool:
@@ -64,6 +82,8 @@ def merge_scoped_contexts(parent: Optional[ScopedContext], child: Optional[Scope
 
 
 class SubAgentConfig(BaseModel):
+    db_read_only: Optional[bool] = None
+    workspace_root: Optional[str] = None
     system_prompt: str = Field("", init=True, description="Name of sub agent")
     agent_description: Optional[str] = Field(default=None, init=True, description="Description of sub agent")
     node_class: Optional[str] = Field(
@@ -75,7 +95,10 @@ class SubAgentConfig(BaseModel):
 
     @field_validator("tools", mode="before")
     @classmethod
-    def normalize_tools(cls, value):
+    def normalize_tools(cls, value, info: ValidationInfo):
+        # A replaced tool name (sub-agents built by the API, the editor or a
+        # parent agent) becomes its successors here, as agent.yml's do on load.
+        value = expand_replaced_tools(str(info.data.get("system_prompt") or ""), value)
         if isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value):
             return ",".join(item.strip() for item in value if item.strip())
         return value

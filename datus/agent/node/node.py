@@ -31,7 +31,6 @@ from datus.schemas.node_models import (
 from datus.schemas.schema_linking_node_models import SchemaLinkingInput, SchemaLinkingResult
 from datus.tools.db_tools.db_manager import db_manager_instance
 from datus.utils.loggings import get_logger
-from datus.utils.node_utils import validate_node_class
 
 logger = get_logger(__name__)
 
@@ -59,8 +58,6 @@ class Node(ABC):
         execution_mode: Literal["interactive", "workflow"] = "workflow",
     ):
         """Construct a node with workflow defaults or the delegating caller's execution mode."""
-        validate_node_class(node_type, node_name or node_id)
-
         from datus.agent.node import (
             BeginNode,
             ChatAgenticNode,
@@ -76,6 +73,39 @@ class Node(ABC):
             SubworkflowNode,
         )
 
+        if node_type in {"analytics_explorer", "analytics_builder"}:
+            from datus.agent.node.analytics_agentic_node import (
+                AnalyticsBuilderAgenticNode,
+                AnalyticsExplorerAgenticNode,
+            )
+
+            cls = AnalyticsBuilderAgenticNode if node_type == "analytics_builder" else AnalyticsExplorerAgenticNode
+            return cls(
+                node_id,
+                description,
+                node_type,
+                input_data,
+                agent_config,
+                tools,
+                node_name=node_name,
+                execution_mode=execution_mode,
+                is_subagent=is_subagent,
+                session_id=session_id,
+            )
+        if node_type == NodeType.TYPE_CONFIGURABLE:
+            from datus.agent.node.configurable_agentic_node import ConfigurableAgenticNode
+
+            return ConfigurableAgenticNode(
+                node_id,
+                description,
+                node_type,
+                input_data,
+                agent_config,
+                node_name=node_name,
+                is_subagent=is_subagent,
+                session_id=session_id,
+                execution_mode=execution_mode,
+            )
         if node_type == NodeType.TYPE_SCHEMA_LINKING:
             return SchemaLinkingNode(node_id, description, node_type, input_data, agent_config)
         elif node_type == NodeType.TYPE_EXECUTE_SQL:
@@ -496,8 +526,16 @@ class Node(ABC):
                     input_data = OutputInput(**input_data)
                 elif node_dict["type"] == NodeType.TYPE_FIX:
                     input_data = FixInput(**input_data)
-                elif node_dict["type"] == NodeType.TYPE_CHAT:
+                elif node_dict["type"] in {
+                    NodeType.TYPE_CHAT,
+                    NodeType.TYPE_ANALYTICS_EXPLORER,
+                    NodeType.TYPE_ANALYTICS_BUILDER,
+                }:
                     input_data = ChatNodeInput(**input_data)
+                elif node_dict["type"] == NodeType.TYPE_CONFIGURABLE:
+                    from datus.schemas.configurable_agentic_node_models import ConfigurableNodeInput
+
+                    input_data = ConfigurableNodeInput(**input_data)
                 elif node_dict["type"] == NodeType.TYPE_GEN_SQL:
                     input_data = GenSQLNodeInput(**input_data)
                 elif node_dict["type"] == NodeType.TYPE_ASK_METRICS:
@@ -531,6 +569,11 @@ class Node(ABC):
             node_type=node_dict["type"],
             input_data=input_data,
             agent_config=agent_config,
+            node_name=(
+                (node_dict.get("metadata") or {}).get("agent_name")
+                if node_dict["type"] == NodeType.TYPE_CONFIGURABLE
+                else None
+            ),
         )
 
         # Convert result data based on node type
@@ -546,6 +589,10 @@ class Node(ABC):
                     result_data = OutputResult(**result_data)
                 elif node_dict["type"] == NodeType.TYPE_CHAT:
                     result_data = ChatNodeResult(**result_data)
+                elif node_dict["type"] == NodeType.TYPE_CONFIGURABLE:
+                    from datus.schemas.configurable_agentic_node_models import ConfigurableNodeResult
+
+                    result_data = ConfigurableNodeResult(**result_data)
                 elif node_dict["type"] == NodeType.TYPE_GEN_SQL:
                     result_data = GenSQLNodeResult(**result_data)
                 elif node_dict["type"] == NodeType.TYPE_ASK_METRICS:

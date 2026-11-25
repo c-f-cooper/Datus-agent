@@ -146,7 +146,7 @@ def test_bulk_and_spool_keep_indirect_callers_without_selecting_the_whole_tools_
     assert "tests/unit_tests/tools/registry/test_capabilities.py" in plan["targets"]
     assert "tests/unit_tests/tools/func_tool/test_database.py" in plan["targets"]
     assert plan["integration_groups"] == ["cli", "database"]
-    assert len(plan["core_nodeids"]) == 16
+    assert len(plan["core_nodeids"]) == 19
     assert plan["coverage_applicable"] is True
 
 
@@ -156,7 +156,7 @@ def test_full_unit_selection_does_not_imply_every_integration_group():
     assert plan["integration_groups"] == ["cli", "database"]
     unknown = pr_test_plan(["datus/new_unowned_module.py"])
     assert unknown["targets"] == ["tests/unit_tests/"]
-    assert len(unknown["core_nodeids"]) == 16
+    assert len(unknown["core_nodeids"]) == 19
 
 
 @pytest.mark.parametrize(
@@ -256,3 +256,19 @@ def test_live_contract(): raise AssertionError('nightly only')
         "test_contract",
     }
     assert set(execution["outcomes"].values()) == {"passed"}
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "datus/api/services/chat_task_manager.py",
+        "datus/api/services/datus_service_cache.py",
+        "datus/tools/db_tools/db_manager.py",
+        "datus/tools/db_tools/connection_scope.py",
+        "datus/tools/func_tool/database.py",
+        "datus/utils/async_utils.py",
+    ],
+)
+def test_resource_lifecycle_changes_select_the_complete_http_acceptance_file(source):
+    """New lifetime cases must run for their real owners, not only when the tests change."""
+    assert "tests/integration/api/test_chat_acceptance.py" in pr_test_plan([source])["pytest_targets"]

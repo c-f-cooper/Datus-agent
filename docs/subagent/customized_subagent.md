@@ -1,5 +1,7 @@
 # Customized Subagents
 
+For generic definitions with explicit skills, tools, MCP and `scoped_context`, or private plugin runtimes, see [Configurable subagents](configurable_subagent.md). The TUI workflow below manages existing typed custom agents.
+
 ## Overview
 
 Both `/agent` and `/subagent` open the **unified agent management TUI**. The TUI has two tabs:
@@ -17,8 +19,6 @@ The wizard writes two things:
 
 1. A new entry under `agent.agentic_nodes`
 2. A prompt template file named like `{agent_name}_system_{prompt_version}.j2`
-
-`gen_report` is no longer available. Configurations referencing it return a subagent-not-found error and recommend `gen_visual_report`.
 
 The wizard currently supports three custom node styles:
 
